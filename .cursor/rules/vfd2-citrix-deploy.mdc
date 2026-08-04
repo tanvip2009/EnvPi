@@ -1,0 +1,43 @@
+---
+description: VFD2 EnvPilot Citrix KIAS deploy — timing, focus, and Edge launch rules
+globs: vfd2_env_backend.py,vfd2-env.ps1,deploy.ps1,logs/**
+alwaysApply: false
+---
+
+# VFD2 Citrix / KIAS Deploy Rules
+
+## Known failure (do not ignore)
+
+Citrix **KIAS DEV & TEST DESKTOP** takes time to launch and load. If **Start** is sent too early, keyboard input goes to **local Windows** (host), not the Citrix session.
+
+**Evidence from logs:**
+- `host_captured: true` + fg_title like `We're having trouble loading your feed` → local host
+- `viewer_is_foreground: false` + fg_title `WinUI Desktop` → focus lost
+- Works on retry when fg_title is `KIAS DEV & TEST DESKTOP - Desktop Viewer`
+
+## Required order before Edge / Start / keyboard automation
+
+1. Wait for KIAS desktop window (`Desktop Viewer` in title)
+2. Unlock desktop if locked (`_prepare_kias_desktop_session`)
+3. Wait settle time (`CITRIX_DESKTOP_SETTLE_SECONDS`) after desktop opens
+4. Verify **foreground hwnd == desktop_hwnd** and **`host_captured == false`**
+5. Only then: Start → search `edge` → Enter (inside Citrix)
+
+## Hard constraints
+
+- **Never** use Win+R for Edge in Citrix flow
+- **Never** launch Edge on local/host machine for Jenkins deploy
+- **Never** send Start key until Citrix viewer has keyboard focus
+- Retry with Escape + refocus if host captures Start menu (up to 5 attempts)
+
+## Key files
+
+- `vfd2_env_backend.py` — `_launch_edge_via_citrix_start_search`, `_complete_citrix_desktop_session`, `_run_deploy_after_citrix_desktop`
+- Logs: `logs\vfd2_env_*.log`, `debug-194f10.log`
+
+## Success criteria
+
+- `viewer_is_foreground: true` before Start key
+- `host_captured: false` after Start key
+- Edge opens **inside** Citrix session (title contains `\Remote` or Jenkins URL)
+- First Deploy attempt succeeds without manual retry

@@ -1,0 +1,27 @@
+# Credentials and machine-specific identity — never commit
+jenkins-upload-credentials.json
+putty-credentials.json
+citrix-id.txt
+deploy-data.csv
+
+# Python environment and bytecode.
+# vfd2_env_backend_compiled.pyc is the only surviving artifact of the 2026-07-30
+# backend build, so it is deliberately kept under version control.
+.venv/
+__pycache__/
+*.py[cod]
+!vfd2_env_backend_compiled.pyc
+
+# Edge automation profile — ~700 MB and machine-specific
+.edge-automation-profile/
+
+# Runtime output
+logs/
+downloads/
+debug-*.log
+
+# Captured Jenkins pages/screenshots — regenerable, and may embed session tokens
+jenkins_debug/
+
+# Local recovery snapshots, managed outside version control
+backups/

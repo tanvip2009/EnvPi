@@ -1,0 +1,5 @@
+selenium>=4.15.0
+pyperclip>=1.8.2
+pillow>=10.0.0
+pytesseract>=0.3.10
+uiautomation>=2.0.20

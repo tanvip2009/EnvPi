@@ -1,0 +1,41 @@
+---
+description: Paste template for clear tasks — context, constraints, success criteria
+alwaysApply: false
+---
+
+# User Prompt Template (copy into chat)
+
+```text
+## Context
+- Project: C:\Users\tanvip\Bat file for deployment\VFD2 Env
+- Files: [list files]
+- Environment: [Windows / Citrix KIAS / Jenkins]
+
+## Current behavior
+1. ...
+
+## Expected behavior
+1. ...
+
+## My observation
+- ...
+
+## Read first (before any change)
+- logs\vfd2_env_[latest].log
+- debug-194f10.log
+
+## Constraints
+- Do not assume Citrix desktop is open
+- Do not assume Docker installed
+- Only modify: [file names]
+- Do not use Win+R for Citrix Edge
+
+## Success criteria
+- [ ] ...
+- [ ] ...
+
+## Task
+[One clear action]
+```
+
+Use **Step 1: read logs and explain** then **Step 2: fix after I confirm** for risky changes.
