@@ -28,8 +28,10 @@ Overrides (see ``_apply_overrides``):
    open by a previous parameter attempt covers the form below it and can black
    out the window capture, which is why FOLDER_NAME and BuildNumber were
    reported as "label never found" while sitting below the fold. On failure it
-   also dumps a screenshot, since the run that exposed this saved none past the
-   params page and left the cause unprovable.
+   dumps a screenshot and then rewinds to the top of the page before retrying:
+   the original only ever scrolls DOWN, on the assumption that fields are filled
+   top-to-bottom, so once the page slipped past ProjectName no amount of further
+   scrolling could bring it back.
 4. ``_jenkins_ocr_read`` warns when a capture yields zero tokens, to distinguish
    "text genuinely absent" from "window captured black".
 5. ``_resize_jenkins_edge_window`` always applies ``SetWindowPos`` to the work
@@ -37,11 +39,25 @@ Overrides (see ``_apply_overrides``):
    large enough, and logged the target size rather than the actual result).
    The override restores minimized/maximized windows first, verifies with
    ``GetWindowRect``, retries once, and warns when height stays far below target.
+6. ``_run_jenkins_ocr_deploy`` maximizes the remote Edge window from inside the
+   Citrix session (Win+Up) before the OCR flow starts. The Jenkins window is
+   created with Ctrl+N on the user's existing remote Edge, so Chromium clones
+   that window's geometry; when the source window is short the Jenkins window
+   is short too, the login fields land below the fold, and the zoom-out-to-fit
+   fallback fires. That is the root cause of the zoom-out, not a zoom bug.
 
-The window is deliberately NOT maximized. The bytecode documents that maximizing
-the seamless Citrix Edge window makes Windows screen-capture return an all-black
-frame (Citrix HDX capture protection), yielding 0 OCR tokens. It is instead sized
-to fill the work area as a normal window, which keeps it capturable.
+Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
+window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
+pipeline receives stays 1920x569. Only the remote window manager can resize the
+window Edge actually paints into, hence Win+Up.
+
+``ShowWindow(SW_MAXIMIZE)`` remains off-limits — the bytecode documents that
+this host-side call pushes the seamless Edge window into a compositor state
+where Windows screen-capture returns an all-black frame (Citrix HDX capture
+protection), yielding 0 OCR tokens. Win+Up goes through the remote window
+manager instead, and override 6 verifies the capture afterwards and undoes it
+with Win+Down if the frame comes back black. Once an in-session maximize
+succeeds, override 5 stands down so host-side resizing cannot undo it.
 """
 
 import ctypes
@@ -76,6 +92,9 @@ def _apply_overrides(ns):
 
     # Cumulative zoom-out steps since the last reset to 100%.
     budget = {"used": 0}
+    # Set once the remote window has been maximized from inside the session,
+    # after which host-side SetWindowPos must stand down (see below).
+    remote_state = {"maximized": False, "tried": False}
 
     def _arg(args, kwargs, index, name, default=None):
         if name in kwargs:
@@ -236,6 +255,7 @@ def _apply_overrides(ns):
     orig_reveal = ns.get("_jenkins_reveal_label")
     send_escape = ns.get("_send_escape_key")
     ocr_dump = ns.get("_jenkins_ocr_dump")
+    scroll_to_top = ns.get("_jenkins_scroll_to_top")
 
     if callable(orig_reveal):
 
@@ -264,6 +284,21 @@ def _apply_overrides(ns):
                         ocr_dump(edge_hwnd, "reveal_fail", logger)
                     except Exception:
                         pass
+                # The original only ever scrolls DOWN, so a label that has moved
+                # above the viewport is unreachable. Rewind to the top so the
+                # downward scan can find it again.
+                if callable(scroll_to_top):
+                    try:
+                        scroll_to_top(edge_hwnd, logger)
+                        time.sleep(0.5)
+                        if logger is not None:
+                            logger.info(
+                                "Jenkins OCR: scrolled back to top before "
+                                "retrying label %s",
+                                labels,
+                            )
+                    except Exception:
+                        pass
                 result = orig_reveal(edge_hwnd, labels, logger)
             return result
 
@@ -290,8 +325,174 @@ def _apply_overrides(ns):
 
         ns["_jenkins_ocr_read"] = _jenkins_ocr_read
 
+    capture_image = ns.get("_capture_viewer_client_image")
+    orig_ocr_deploy = ns.get("_run_jenkins_ocr_deploy")
+
+    def _work_area_height():
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0):
+            return user32.GetSystemMetrics(1)
+        return rect.bottom - rect.top
+
+    def _capture_size(hwnd):
+        """Real on-screen size of the remote window, as the OCR pipeline sees it.
+
+        GetWindowRect reports the seamless proxy rectangle, which stays at the
+        size host-side SetWindowPos asked for even when the remote window never
+        changed. Only the capture tells the truth.
+        """
+        if not callable(capture_image) or not hwnd:
+            return 0, 0
+        try:
+            image = capture_image(hwnd)
+            if image is None:
+                return 0, 0
+            return int(image.size[0]), int(image.size[1])
+        except Exception:
+            return 0, 0
+
+    def _send_win_arrow(up):
+        """Win+Up / Win+Down as a chord, for the remote window manager."""
+        user32 = ctypes.windll.user32
+        VK_LWIN, VK_UP, VK_DOWN = 0x5B, 0x26, 0x28
+        EXT, KEYUP = 0x0001, 0x0002
+        vk = VK_UP if up else VK_DOWN
+        user32.keybd_event(VK_LWIN, 0, 0, 0)
+        time.sleep(0.06)
+        user32.keybd_event(vk, 0, EXT, 0)
+        time.sleep(0.06)
+        user32.keybd_event(vk, 0, EXT | KEYUP, 0)
+        time.sleep(0.06)
+        user32.keybd_event(VK_LWIN, 0, KEYUP, 0)
+
+    def _maximize_remote_edge(edge_hwnd, logger):
+        """Maximize the Jenkins Edge window from *inside* the Citrix session.
+
+        The window is created with Ctrl+N on the user's existing remote Edge,
+        so Chromium clones that window's geometry — which is why Jenkins came
+        up ~569px tall and the login fields sat below the fold, triggering the
+        zoom-out-to-fit fallback. Host-side SetWindowPos cannot fix it: it
+        moves the seamless proxy only, reporting 1920x1032 while the capture
+        stays 569. Win+Up is handled by the *remote* window manager, so it
+        resizes the window Edge is actually painting into.
+
+        This is deliberately not ShowWindow(SW_MAXIMIZE): that host-side call
+        is what puts the seamless window into the compositor state where HDX
+        returns an all-black capture. If Win+Up produces a black or empty
+        capture anyway, it is undone with Win+Down.
+        """
+        if sys.platform != "win32" or not edge_hwnd:
+            return False
+        if remote_state["tried"]:
+            return remote_state["maximized"]
+        remote_state["tried"] = True
+        if os.environ.get("ENVPILOT_REMOTE_MAXIMIZE", "1") == "0":
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: in-session maximize disabled "
+                    "(ENVPILOT_REMOTE_MAXIMIZE=0)"
+                )
+            return False
+
+        target_h = _work_area_height()
+        before_w, before_h = _capture_size(edge_hwnd)
+        if before_h and before_h >= target_h * 0.85:
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: remote Edge already full height "
+                    "(capture %dx%d) — no maximize needed",
+                    before_w,
+                    before_h,
+                )
+            return False
+
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: remote Edge capture is %dx%d (target height %d) "
+                "— maximizing inside the Citrix session with Win+Up",
+                before_w,
+                before_h,
+                target_h,
+            )
+
+        if callable(release_mods):
+            try:
+                release_mods()
+            except Exception:
+                pass
+        _prepare_remote_input(edge_hwnd, logger)
+
+        try:
+            _send_win_arrow(True)
+        except Exception as exc:
+            if logger is not None:
+                logger.warning("Jenkins OCR: Win+Up failed: %s", exc)
+            return False
+        time.sleep(1.2)
+
+        after_w, after_h = _capture_size(edge_hwnd)
+        if after_h == 0:
+            if logger is not None:
+                logger.warning(
+                    "Jenkins OCR: capture went black/empty after Win+Up "
+                    "(HDX capture protection) — undoing with Win+Down"
+                )
+            try:
+                _send_win_arrow(False)
+                time.sleep(1.0)
+            except Exception:
+                pass
+            return False
+
+        if after_h > before_h * 1.1 or after_h >= target_h * 0.85:
+            remote_state["maximized"] = True
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: in-session maximize worked — capture now "
+                    "%dx%d (was %dx%d); host-side resize disabled from here",
+                    after_w,
+                    after_h,
+                    before_w,
+                    before_h,
+                )
+            return True
+
+        if logger is not None:
+            logger.warning(
+                "Jenkins OCR: Win+Up did not enlarge the remote window "
+                "(capture %dx%d, was %dx%d) — the Citrix Desktop Viewer "
+                "itself is likely too short",
+                after_w,
+                after_h,
+                before_w,
+                before_h,
+            )
+        return False
+
+    if callable(orig_ocr_deploy):
+
+        def _run_jenkins_ocr_deploy(*args, **kwargs):
+            edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
+            logger = _arg(args, kwargs, 4, "logger")
+            try:
+                _maximize_remote_edge(edge_hwnd, logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: in-session maximize skipped (%s)", exc
+                    )
+            return orig_ocr_deploy(*args, **kwargs)
+
+        ns["_run_jenkins_ocr_deploy"] = _run_jenkins_ocr_deploy
+
     def _resize_jenkins_edge_window(edge_hwnd, logger):
         if sys.platform != "win32" or not edge_hwnd:
+            return None
+        # A window maximized by the remote window manager must not be poked
+        # with host-side SetWindowPos: that drags the seamless proxy back to
+        # "normal" geometry and undoes the height we just gained.
+        if remote_state["maximized"]:
             return None
         user32 = ctypes.windll.user32
         SW_RESTORE = 9
