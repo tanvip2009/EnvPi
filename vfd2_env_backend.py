@@ -46,6 +46,30 @@ Overrides (see ``_apply_overrides``):
    is short too, the login fields land below the fold, and the zoom-out-to-fit
    fallback fires. That is the root cause of the zoom-out, not a zoom bug.
 
+7. ``_get_client_area_screen_point`` repairs a destroyed Edge window handle.
+   Opening a native ``<select>`` in the seamless session destroys the local
+   proxy window; Citrix creates a replacement with a different handle, but the
+   old one stayed threaded through every later call, so ``GetWindowRect``
+   returned 0x0 and every capture came back empty for the rest of the run.
+   This is the one function capture, click and scroll all funnel through, so
+   recovering the handle here fixes all three at once.
+8. ``_jenkins_ocr_select_dropdown`` anchors its click to the label's LEFT edge
+   rather than ``label_centre + 3%``, and dumps a screenshot when a field
+   cannot be selected. Jenkins renders each ``<select>`` left-aligned under
+   its label; a narrow one (ProjectName showing "OGW") is only ~3% wide, so
+   the centre-plus-offset click landed past its right edge on blank page and
+   the list never opened. Release_name is wide enough that the same offset
+   landed inside it, which is why only the narrow selects failed.
+
+9. ``_wait_for_mfa_verification`` polls for the Microsoft MFA page to appear
+   before concluding it is absent. The original checked visibility once, about
+   a second after Sign in was clicked — before Microsoft had rendered the
+   approval page — so it logged "No MFA approval page detected", returned
+   immediately, and never spent any of its 300-second approval budget. The
+   sign-in then sat on an unapproved prompt until the Citrix workspace wait
+   timed out, and the run failed before the NetScaler AD password was ever
+   reached. Appearance budget: ``ENVPILOT_MFA_APPEAR_WAIT`` (default 25s).
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -314,6 +338,10 @@ def _apply_overrides(ns):
                 _image, words = result
             except (TypeError, ValueError):
                 return result
+            try:
+                live["img_w"] = int(_image.size[0])
+            except Exception:
+                pass
             if not words:
                 logger = _arg(args, kwargs, 1, "logger")
                 if logger is not None:
@@ -327,6 +355,60 @@ def _apply_overrides(ns):
 
     capture_image = ns.get("_capture_viewer_client_image")
     orig_ocr_deploy = ns.get("_run_jenkins_ocr_deploy")
+    orig_client_point = ns.get("_get_client_area_screen_point")
+    find_edge_hwnd = ns.get("_find_jenkins_edge_hwnd")
+
+    # Last handle known to be alive, and the last logger seen, so the handle
+    # recovery below can report itself even from call sites that take no logger.
+    live = {"hwnd": None, "logger": None, "recoveries": 0}
+
+    def _live_hwnd(hwnd):
+        """Return a valid Edge handle, re-resolving if the given one is dead.
+
+        Interacting with a native <select> in the seamless Citrix session
+        destroys the local proxy window and Citrix builds a new one with a
+        different handle. Every later call still carried the old handle, so
+        GetWindowRect returned 0x0, every capture came back empty, and the
+        flow spent minutes scrolling for labels it could no longer see. The
+        handle is threaded by value through the whole call chain, so it is
+        repaired here: _get_client_area_screen_point is the one function that
+        capture, click and scroll all go through.
+        """
+        if sys.platform != "win32":
+            return hwnd
+        user32 = ctypes.windll.user32
+        if hwnd and user32.IsWindow(hwnd):
+            live["hwnd"] = hwnd
+            return hwnd
+        if live["hwnd"] and user32.IsWindow(live["hwnd"]):
+            return live["hwnd"]
+        if not callable(find_edge_hwnd):
+            return hwnd
+        try:
+            fresh = find_edge_hwnd(live["logger"])
+        except Exception:
+            return hwnd
+        if fresh and user32.IsWindow(fresh):
+            live["hwnd"] = fresh
+            live["recoveries"] += 1
+            logger = live["logger"]
+            if logger is not None and live["recoveries"] <= 5:
+                logger.warning(
+                    "Jenkins OCR: Edge handle %r was destroyed (likely a "
+                    "native dropdown popup recreating the Citrix seamless "
+                    "window) — recovered handle %r",
+                    hwnd,
+                    fresh,
+                )
+            return fresh
+        return hwnd
+
+    if callable(orig_client_point):
+
+        def _get_client_area_screen_point(hwnd, rel_x_ratio, rel_y_ratio):
+            return orig_client_point(_live_hwnd(hwnd), rel_x_ratio, rel_y_ratio)
+
+        ns["_get_client_area_screen_point"] = _get_client_area_screen_point
 
     def _work_area_height():
         user32 = ctypes.windll.user32
@@ -475,6 +557,7 @@ def _apply_overrides(ns):
         def _run_jenkins_ocr_deploy(*args, **kwargs):
             edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
             logger = _arg(args, kwargs, 4, "logger")
+            live["logger"] = logger
             try:
                 _maximize_remote_edge(edge_hwnd, logger)
             except Exception as exc:
@@ -486,9 +569,136 @@ def _apply_overrides(ns):
 
         ns["_run_jenkins_ocr_deploy"] = _run_jenkins_ocr_deploy
 
+    orig_select = ns.get("_jenkins_ocr_select_dropdown")
+
+    if callable(orig_select):
+
+        def _jenkins_ocr_select_dropdown(*args, **kwargs):
+            logger = _arg(args, kwargs, 4, "logger")
+            if logger is not None:
+                live["logger"] = logger
+
+            # The dropdown code clicks at label_centre_x + 3%. Jenkins renders
+            # each <select> left-aligned under its label, and a narrow one
+            # (ProjectName showing "OGW", ENVIRONMENT_NAME showing "SIT1") is
+            # only ~3% wide — so +3% from the label CENTRE lands past its right
+            # edge, on blank page, and the list never opens. Release_name is
+            # wide enough that the same offset happens to land inside it, which
+            # is why only the narrow ones failed. Reporting the label's left
+            # edge instead puts the click inside the control at any width.
+            # Scoped to this call so text-field and login paths are untouched.
+            current_reveal = ns.get("_jenkins_reveal_label")
+
+            def _left_aligned_reveal(edge_hwnd, labels, logger_):
+                result_ = current_reveal(edge_hwnd, labels, logger_)
+                try:
+                    label, words = result_
+                except (TypeError, ValueError):
+                    return result_
+                img_w = live.get("img_w")
+                if not label or not img_w:
+                    return label, words
+                try:
+                    left_ratio = float(label["left"]) / float(img_w)
+                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                    return label, words
+                shifted = dict(label)
+                shifted["cx"] = max(0.01, left_ratio - 0.015)
+                if logger_ is not None:
+                    logger_.info(
+                        "Jenkins OCR: dropdown click anchored to label left "
+                        "edge (cx %.3f -> %.3f) so narrow selects are hit",
+                        label.get("cx", -1),
+                        shifted["cx"],
+                    )
+                return shifted, words
+
+            if callable(current_reveal):
+                ns["_jenkins_reveal_label"] = _left_aligned_reveal
+            try:
+                result = orig_select(*args, **kwargs)
+            finally:
+                if callable(current_reveal):
+                    ns["_jenkins_reveal_label"] = current_reveal
+
+            if not result:
+                edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
+                field_key = _arg(args, kwargs, 3, "field_key", "dropdown")
+                if callable(ocr_dump):
+                    try:
+                        ocr_dump(
+                            _live_hwnd(edge_hwnd),
+                            "dropdown_fail_{}".format(field_key),
+                            logger,
+                        )
+                    except Exception:
+                        pass
+            return result
+
+        ns["_jenkins_ocr_select_dropdown"] = _jenkins_ocr_select_dropdown
+
+    orig_mfa_wait = ns.get("_wait_for_mfa_verification")
+    mfa_page_visible = ns.get("_mfa_approval_page_visible")
+    stay_page_visible = ns.get("_stay_signed_in_page_visible")
+
+    if callable(orig_mfa_wait) and callable(mfa_page_visible):
+
+        def _wait_for_mfa_verification(driver, logger, timeout=300):
+            """Wait for the MFA page to APPEAR before deciding it is absent.
+
+            The original checks visibility once, roughly a second after Sign in
+            is clicked. Microsoft has usually not rendered the approval page by
+            then, so it logged "No MFA approval page detected", returned, and
+            never spent any of its 300-second approval budget — leaving the
+            sign-in sitting on an unapproved MFA prompt until the Citrix
+            workspace wait timed out.
+            """
+            try:
+                appear_wait = float(
+                    os.environ.get("ENVPILOT_MFA_APPEAR_WAIT", "25")
+                )
+            except ValueError:
+                appear_wait = 25.0
+
+            deadline = time.time() + appear_wait
+            started = time.time()
+            while time.time() < deadline:
+                try:
+                    if mfa_page_visible(driver):
+                        if logger is not None:
+                            logger.info(
+                                "MFA approval page appeared %.1fs after Sign in "
+                                "— APPROVE THE REQUEST ON YOUR PHONE",
+                                time.time() - started,
+                            )
+                        break
+                except Exception:
+                    pass
+                # Already past MFA (silent SSO or remembered device).
+                if callable(stay_page_visible):
+                    try:
+                        if stay_page_visible(driver):
+                            break
+                    except Exception:
+                        pass
+                time.sleep(1.0)
+            else:
+                if logger is not None:
+                    logger.info(
+                        "No MFA approval page within %.0fs of Sign in — "
+                        "continuing without an MFA wait",
+                        appear_wait,
+                    )
+            return orig_mfa_wait(driver, logger, timeout)
+
+        ns["_wait_for_mfa_verification"] = _wait_for_mfa_verification
+
     def _resize_jenkins_edge_window(edge_hwnd, logger):
         if sys.platform != "win32" or not edge_hwnd:
             return None
+        if logger is not None:
+            live["logger"] = logger
+        edge_hwnd = _live_hwnd(edge_hwnd)
         # A window maximized by the remote window manager must not be poked
         # with host-side SetWindowPos: that drags the seamless proxy back to
         # "normal" geometry and undoes the height we just gained.
