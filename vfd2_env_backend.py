@@ -70,6 +70,24 @@ Overrides (see ``_apply_overrides``):
    timed out, and the run failed before the NetScaler AD password was ever
    reached. Appearance budget: ``ENVPILOT_MFA_APPEAR_WAIT`` (default 25s).
 
+10. ``_page_advanced_after_continue`` demands positive evidence that the Access
+    Rules step really was accepted. Its last resort is
+    ``_is_citrix_auth_progress_url(url)``, and ``CITRIX_AUTH_URL_MARKERS``
+    contains ``deshpda.caas.vodafone.com``, ``logonpoint`` and ``/logon/`` —
+    the Access Rules page's own address. Sitting ON the unaccepted page
+    therefore reads as having advanced past it, unless
+    ``_disclaimer_page_visible`` or the ``access rules`` page-source probe
+    catches it first. On a cold Edge profile neither did: the page had not
+    rendered that text yet, ``_access_rules_step_needed`` was told the step was
+    already done, Continue was never clicked, the browser never reached the
+    Microsoft SAML endpoint, and the 60s redirect wait plus the 45s
+    email/password wait both expired against a URL that could never match
+    ``login.microsoftonline.com`` — surfacing as an empty Selenium
+    ``TimeoutException`` after ~128s. The override keeps every original signal
+    and only vetoes the fallback while the browser is still on the logon point
+    with no Microsoft form, no AD Password field and no loaded Workspace. Set
+    ``ENVPILOT_STRICT_ACCESS_RULES=0`` to restore the original behaviour.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -692,6 +710,66 @@ def _apply_overrides(ns):
             return orig_mfa_wait(driver, logger, timeout)
 
         ns["_wait_for_mfa_verification"] = _wait_for_mfa_verification
+
+    orig_advanced = ns.get("_page_advanced_after_continue")
+    orig_any_advanced = ns.get("_any_tab_page_advanced_after_continue")
+    netscaler_visible = ns.get("_netscaler_logon_page_visible")
+    workspace_loaded = ns.get("_citrix_workspace_loaded")
+    strict_access_rules = os.environ.get(
+        "ENVPILOT_STRICT_ACCESS_RULES", "1"
+    ).strip().lower() not in ("0", "false", "no")
+
+    if callable(orig_advanced) and strict_access_rules:
+        # _page_advanced_after_continue takes no logger of its own; the caller
+        # that has one is _any_tab_page_advanced_after_continue, so keep the
+        # most recent logger here to report a veto in the session log.
+        advanced_log = {"logger": None}
+
+        def _page_advanced_after_continue(driver):
+            """Treat the logon point as advanced only on positive evidence."""
+            if not orig_advanced(driver):
+                return False
+            try:
+                url = (driver.current_url or "").lower()
+            except Exception:
+                return True
+            if "login.microsoftonline.com" in url or "login.live.com" in url:
+                return True
+            if callable(netscaler_visible):
+                try:
+                    if netscaler_visible(driver, None):
+                        return True
+                except Exception:
+                    pass
+            if callable(workspace_loaded):
+                try:
+                    if workspace_loaded(driver):
+                        return True
+                except Exception:
+                    pass
+            if "logonpoint" not in url and "/logon/" not in url:
+                return True
+            logger = advanced_log["logger"]
+            if logger is not None:
+                logger.info(
+                    "Still on the NetScaler logon point with no Microsoft form, "
+                    "AD Password field or Workspace - treating Access Rules as "
+                    "NOT yet accepted: %s",
+                    url,
+                )
+            return False
+
+        ns["_page_advanced_after_continue"] = _page_advanced_after_continue
+
+        if callable(orig_any_advanced):
+
+            def _any_tab_page_advanced_after_continue(*args, **kwargs):
+                advanced_log["logger"] = _arg(args, kwargs, 1, "logger")
+                return orig_any_advanced(*args, **kwargs)
+
+            ns["_any_tab_page_advanced_after_continue"] = (
+                _any_tab_page_advanced_after_continue
+            )
 
     def _resize_jenkins_edge_window(edge_hwnd, logger):
         if sys.platform != "win32" or not edge_hwnd:
