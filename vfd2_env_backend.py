@@ -88,6 +88,20 @@ Overrides (see ``_apply_overrides``):
     with no Microsoft form, no AD Password field and no loaded Workspace. Set
     ``ENVPILOT_STRICT_ACCESS_RULES=0`` to restore the original behaviour.
 
+11. ``_enable_per_monitor_dpi_awareness`` (import time, not an override) makes
+    the process report window geometry in physical pixels. Without it Windows
+    scales ``GetWindowRect`` and ``SPI_GETWORKAREA`` down by the display
+    scaling factor while screen capture stays physical, so at 175% a
+    full-screen remote Edge measured 1097x638 against a 1920x1200 screen.
+    The OCR bbox then captured only the top-left 57% of the window, the
+    Jenkins login card sat clipped in the bottom-right corner of every
+    capture, and the Username click — computed as a ratio of that crop —
+    landed on the label instead of the input, retried 18 times and gave up
+    with "box click kept missing". The same mismatch made resizing look
+    inert, since the work-area target was measured in the same shrunken
+    units the window already matched. Set ``ENVPILOT_DPI_AWARE=0`` to restore
+    the original behaviour.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -111,6 +125,63 @@ from ctypes import wintypes
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COMPILED = os.path.join(_HERE, "vfd2_env_backend_compiled.pyc")
+
+
+def _enable_per_monitor_dpi_awareness():
+    """Make this process report window geometry in physical pixels.
+
+    Windows lies to DPI-unaware processes: GetWindowRect and SPI_GETWORKAREA
+    come back in logical (scale-divided) pixels, while a desktop screen grab
+    always returns physical ones. At 175% scaling that is a 1.75x discrepancy,
+    so a full-screen remote Edge window measured 1097x638 while the screen it
+    occupied was 1920x1200. Every capture bbox then cropped the top-left 57%
+    of the window, every OCR ratio was computed against that crop, and the
+    Jenkins Username click landed far up and left of the real box — the
+    "box click kept missing" failure. It also made the resize look inert
+    ("capture stuck at 1097x638"), because the target work area was measured
+    in the same shrunken units the window already matched.
+
+    Declaring per-monitor awareness puts both sides in physical pixels, which
+    is the coordinate space screen capture and SetCursorPos already use.
+    Must run before any window or DC is touched, hence at import time. Set
+    ``ENVPILOT_DPI_AWARE=0`` to restore the previous behaviour.
+    """
+    if sys.platform != "win32":
+        return None
+    if os.environ.get("ENVPILOT_DPI_AWARE", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return "disabled"
+
+    # PER_MONITOR_AWARE_V2, Windows 10 1703+.
+    try:
+        set_ctx = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_ctx.argtypes = [ctypes.c_void_p]
+        set_ctx.restype = ctypes.c_bool
+        if set_ctx(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except (AttributeError, OSError):
+        pass
+
+    # PROCESS_PER_MONITOR_DPI_AWARE, Windows 8.1+. S_OK == 0.
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return "per-monitor"
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except (AttributeError, OSError):
+        pass
+
+    return None
+
+
+_DPI_MODE = _enable_per_monitor_dpi_awareness()
 
 
 def _apply_overrides(ns):
@@ -576,6 +647,13 @@ def _apply_overrides(ns):
             edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
             logger = _arg(args, kwargs, 4, "logger")
             live["logger"] = logger
+            if logger is not None and not live.get("dpi_logged"):
+                live["dpi_logged"] = True
+                logger.info(
+                    "Jenkins OCR: process DPI awareness = %s; window geometry "
+                    "and screen captures now share one coordinate space",
+                    _DPI_MODE or "unchanged (all APIs unavailable)",
+                )
             try:
                 _maximize_remote_edge(edge_hwnd, logger)
             except Exception as exc:
