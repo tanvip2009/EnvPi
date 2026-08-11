@@ -60,6 +60,15 @@ Overrides (see ``_apply_overrides``):
    the centre-plus-offset click landed past its right edge on blank page and
    the list never opened. Release_name is wide enough that the same offset
    landed inside it, which is why only the narrow selects failed.
+   The first version of this override never actually took effect: it read
+   ``label["left"]``, but ``_jenkins_reveal_label`` hands back the
+   ``_jenkins_find_phrase`` centroid, which carries only ``cx``/``cy``. The
+   resulting KeyError was swallowed and the label returned unchanged, so every
+   run kept clicking centre+3% — confirmed by its log line being absent from
+   every session log. ``_label_left_ratio`` now recovers the left edge from the
+   raw OCR word dicts (which do keep pixel geometry) for the words on the
+   label's own row, falls back to ``left`` and then to a ``cx`` estimate, and
+   warns instead of failing silently when no geometry is usable.
 
 9. ``_wait_for_mfa_verification`` polls for the Microsoft MFA page to appear
    before concluding it is absent. The original checked visibility once, about
@@ -429,6 +438,7 @@ def _apply_overrides(ns):
                 return result
             try:
                 live["img_w"] = int(_image.size[0])
+                live["img_h"] = int(_image.size[1])
             except Exception:
                 pass
             if not words:
@@ -666,6 +676,66 @@ def _apply_overrides(ns):
         ns["_run_jenkins_ocr_deploy"] = _run_jenkins_ocr_deploy
 
     orig_select = ns.get("_jenkins_ocr_select_dropdown")
+    normalize_ocr = ns.get("_normalize_ocr_text")
+
+    def _norm_text(value):
+        if callable(normalize_ocr):
+            try:
+                return normalize_ocr(value)
+            except Exception:
+                pass
+        return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+    def _label_left_ratio(label, words, labels):
+        """Left edge of the label, as a 0..1 ratio, and how it was determined.
+
+        ``_jenkins_reveal_label`` returns whatever ``_jenkins_find_phrase``
+        produced, which is a centroid carrying only ``cx``/``cy`` — no ``left``.
+        Reading ``label["left"]`` therefore raises KeyError, and the previous
+        version of this override swallowed that and returned the label
+        untouched, so the re-anchoring silently never happened on any run. The
+        raw OCR word dicts from ``_jenkins_ocr_read`` DO keep pixel geometry,
+        so the left edge is recovered from the words on the label's own row.
+        """
+        img_w = live.get("img_w")
+        img_h = live.get("img_h")
+        label_cy = label.get("cy")
+
+        if img_w and img_h and words and label_cy is not None:
+            wanted = {_norm_text(text) for text in (labels or ()) if text}
+            wanted.discard("")
+            lefts = []
+            for word in words:
+                try:
+                    top = float(word["top"])
+                    height = float(word["height"])
+                    left = float(word["left"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                row_cy = (top + height / 2.0) / float(img_h)
+                if abs(row_cy - float(label_cy)) > 0.015:
+                    continue
+                norm = _norm_text(word.get("norm") or word.get("text") or "")
+                if norm and any(norm == w or norm in w for w in wanted):
+                    lefts.append(left)
+            if lefts:
+                return min(lefts) / float(img_w), "OCR word geometry"
+
+        if img_w:
+            try:
+                return float(label["left"]) / float(img_w), "label left key"
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                pass
+
+        if label_cy is not None and label.get("cx") is not None:
+            # Last resort: approximate the left edge from the centre, so the
+            # compiled centre+3% offset still lands inside a narrow control.
+            try:
+                return max(0.0, float(label["cx"]) - 0.03), "cx estimate"
+            except (TypeError, ValueError):
+                pass
+
+        return None, "no usable label geometry"
 
     if callable(orig_select):
 
@@ -691,20 +761,25 @@ def _apply_overrides(ns):
                     label, words = result_
                 except (TypeError, ValueError):
                     return result_
-                img_w = live.get("img_w")
-                if not label or not img_w:
+                if not label:
                     return label, words
-                try:
-                    left_ratio = float(label["left"]) / float(img_w)
-                except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                left_ratio, source = _label_left_ratio(label, words, labels)
+                if left_ratio is None:
+                    if logger_ is not None:
+                        logger_.warning(
+                            "Jenkins OCR: dropdown click NOT re-anchored (%s) — "
+                            "the centre+3%% click will miss narrow selects",
+                            source,
+                        )
                     return label, words
                 shifted = dict(label)
                 shifted["cx"] = max(0.01, left_ratio - 0.015)
                 if logger_ is not None:
                     logger_.info(
                         "Jenkins OCR: dropdown click anchored to label left "
-                        "edge (cx %.3f -> %.3f) so narrow selects are hit",
-                        label.get("cx", -1),
+                        "edge via %s (cx %.3f -> %.3f) so narrow selects are hit",
+                        source,
+                        label.get("cx", -1.0),
                         shifted["cx"],
                     )
                 return shifted, words
