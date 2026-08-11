@@ -111,6 +111,20 @@ Overrides (see ``_apply_overrides``):
     units the window already matched. Set ``ENVPILOT_DPI_AWARE=0`` to restore
     the original behaviour.
 
+12. ``_jenkins_focus`` sends Escape after the original runs, to close the Edge
+    menu its own Alt tap opens. The bytecode taps Alt
+    (``keybd_event(18, 0, 0, 0)`` then key-up) before ``BringWindowToTop`` and
+    ``SetForegroundWindow`` to defeat the Windows foreground lock, but
+    Chromium treats a bare Alt press-and-release as the menu accelerator, so
+    every focus call opened the "Settings and more" menu inside the Citrix
+    session — visible as the three-dots button lighting up before each field.
+    An open menu owns the keyboard, so the dropdown filter text and the
+    arrow-scan's Down/Up keys went to the menu rather than the page: selects
+    never opened and the page appeared to scroll by itself, which is the
+    "ProjectName not verified" / "could not select" loop. The Escape already
+    in ``_jenkins_reveal_label`` fires before the reveal, and the Alt tap
+    happens inside it, so it can never close this menu.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -378,6 +392,39 @@ def _apply_overrides(ns):
     send_escape = ns.get("_send_escape_key")
     ocr_dump = ns.get("_jenkins_ocr_dump")
     scroll_to_top = ns.get("_jenkins_scroll_to_top")
+
+    orig_focus = ns.get("_jenkins_focus")
+
+    if callable(orig_focus) and callable(send_escape):
+
+        def _jenkins_focus(*args, **kwargs):
+            """Close the Edge menu that the foreground-lock Alt tap opens.
+
+            ``_jenkins_focus`` taps Alt (``keybd_event(18, ...)`` down then up)
+            before ``BringWindowToTop``/``SetForegroundWindow``, the usual way
+            to defeat the Windows foreground lock. Chromium reads a bare Alt
+            press-and-release as the menu accelerator, so every focus call also
+            opens Edge's "Settings and more" menu inside the Citrix session.
+            While that menu is open it owns the keyboard: the typed filter text
+            and the Down/Up arrows of the dropdown arrow-scan go to the menu
+            instead of the page, so parameter selects never open and the page
+            appears to scroll on its own. The Alt tap is still needed for
+            focus, so the menu is dismissed immediately afterwards instead.
+
+            The Escape in ``_jenkins_reveal_label`` cannot cover this: it fires
+            *before* the reveal, and the Alt tap happens inside it.
+            """
+            result = orig_focus(*args, **kwargs)
+            try:
+                send_escape()
+            except Exception:
+                pass
+            time.sleep(0.15)
+            return result
+
+        ns["_jenkins_focus"] = _jenkins_focus
+        # _prepare_remote_input captured the original before this point.
+        focus = _jenkins_focus
 
     if callable(orig_reveal):
 
