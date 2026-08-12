@@ -137,6 +137,26 @@ Overrides (see ``_apply_overrides``):
     in ``_jenkins_reveal_label`` fires before the reveal, and the Alt tap
     happens inside it, so it can never close this menu.
 
+13. ``_capture_viewer_client_image`` renders the target window itself with
+    ``PrintWindow(PW_RENDERFULLCONTENT)`` instead of photographing its screen
+    rectangle. The bytecode calls ``ImageGrab.grab(bbox=...)`` on the client
+    rectangle, which returns whatever pixels happen to be on that part of the
+    desktop, so any window covering the session is OCR'd in its place — an
+    editor window was captured and read as if it were the Jenkins page, and a
+    minimized window (rectangle collapsed to 160x28 at -32000) returns a black
+    strip. Measured on four live seamless windows: the screen grab captured
+    the covering window every time, while ``PrintWindow`` returned the
+    target's own content, including for the minimized one. The result is
+    cropped back to the client rectangle so its size and origin are identical
+    to the grab and every OCR ratio stays valid. A minimized window is first
+    restored with ``SW_SHOWNOACTIVATE``, which un-minimizes it without taking
+    focus, because a minimized window has no full-size pixels to render. If
+    ``PrintWindow`` yields nothing or a blank frame (HDX may refuse to render
+    the seamless proxy) the original grab is used, and the log says whether
+    another window was on top at the time. Disable with
+    ``ENVPILOT_WINDOW_CAPTURE=0``, keep windows untouched with
+    ``ENVPILOT_RESTORE_MINIMIZED=0``.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -157,6 +177,13 @@ import os
 import sys
 import time
 from ctypes import wintypes
+
+try:
+    from PIL import Image
+except ImportError:
+    # Only the window-owned capture below needs PIL directly; without it that
+    # override stands down and the compiled ImageGrab path is used unchanged.
+    Image = None
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COMPILED = os.path.join(_HERE, "vfd2_env_backend_compiled.pyc")
@@ -567,6 +594,207 @@ def _apply_overrides(ns):
             return orig_client_point(_live_hwnd(hwnd), rel_x_ratio, rel_y_ratio)
 
         ns["_get_client_area_screen_point"] = _get_client_area_screen_point
+
+    class _BitmapInfoHeader(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", ctypes.c_long),
+            ("biHeight", ctypes.c_long),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", ctypes.c_long),
+            ("biYPelsPerMeter", ctypes.c_long),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    def _is_uniform(image):
+        """True when every channel is a single value, i.e. a blank/black frame."""
+        try:
+            return all(lo == hi for lo, hi in image.getextrema())
+        except (TypeError, ValueError):
+            return False
+
+    def _print_window_client_image(hwnd):
+        """Capture the window's OWN pixels, cropped to its client area.
+
+        ``PrintWindow`` asks the window to render itself into a bitmap, so the
+        result is the target's content even when another window covers it. The
+        crop back to the client rectangle keeps the returned image the same
+        size and origin as the ImageGrab path, which every OCR ratio and click
+        coordinate is computed against.
+        """
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        win = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(win)):
+            return None
+        win_w = win.right - win.left
+        win_h = win.bottom - win.top
+        if win_w <= 0 or win_h <= 0:
+            return None
+
+        client = wintypes.RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(client)):
+            return None
+        client_w = client.right - client.left
+        client_h = client.bottom - client.top
+        if client_w <= 0 or client_h <= 0:
+            return None
+
+        origin = wintypes.POINT(0, 0)
+        if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
+            return None
+
+        hdc = user32.GetWindowDC(hwnd)
+        if not hdc:
+            return None
+        mem_dc = bitmap = None
+        try:
+            mem_dc = gdi32.CreateCompatibleDC(hdc)
+            bitmap = gdi32.CreateCompatibleBitmap(hdc, win_w, win_h)
+            if not mem_dc or not bitmap:
+                return None
+            gdi32.SelectObject(mem_dc, bitmap)
+            # PW_RENDERFULLCONTENT (2) is what makes this work for Chromium.
+            if not user32.PrintWindow(hwnd, mem_dc, 2):
+                return None
+
+            header = _BitmapInfoHeader()
+            header.biSize = ctypes.sizeof(_BitmapInfoHeader)
+            header.biWidth = win_w
+            header.biHeight = -win_h  # top-down rows
+            header.biPlanes = 1
+            header.biBitCount = 32
+            buffer = ctypes.create_string_buffer(win_w * win_h * 4)
+            if not gdi32.GetDIBits(
+                mem_dc, bitmap, 0, win_h, buffer, ctypes.byref(header), 0
+            ):
+                return None
+
+            image = Image.frombuffer(
+                "RGBA", (win_w, win_h), buffer, "raw", "BGRA", 0, 1
+            ).convert("RGB")
+        finally:
+            if bitmap:
+                gdi32.DeleteObject(bitmap)
+            if mem_dc:
+                gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(hwnd, hdc)
+
+        off_x = origin.x - win.left
+        off_y = origin.y - win.top
+        if off_x < 0 or off_y < 0:
+            return None
+        if off_x + client_w > win_w or off_y + client_h > win_h:
+            return None
+        return image.crop((off_x, off_y, off_x + client_w, off_y + client_h))
+
+    def _window_is_topmost_at_centre(hwnd):
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        point = wintypes.POINT(
+            (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
+        )
+        top = user32.WindowFromPoint(point)
+        if not top:
+            return None
+        root = user32.GetAncestor(top, 2)  # GA_ROOT
+        return bool(root == hwnd)
+
+    if callable(capture_image) and Image is not None:
+        window_capture_enabled = os.environ.get(
+            "ENVPILOT_WINDOW_CAPTURE", "1"
+        ).strip().lower() not in ("0", "false", "no")
+        restore_minimized = os.environ.get(
+            "ENVPILOT_RESTORE_MINIMIZED", "1"
+        ).strip().lower() not in ("0", "false", "no")
+        orig_capture = capture_image
+        capture_state = {"printed": 0, "grabbed": 0, "occluded": 0, "restored": 0}
+
+        def _capture_viewer_client_image(desktop_hwnd):
+            """Read the target window's own pixels, not whatever is on top.
+
+            The compiled version screenshots the client rectangle off the
+            desktop with ``ImageGrab.grab(bbox=...)``, so any window covering
+            that region is what gets OCR'd — a Teams or Cursor window has been
+            captured and read as if it were the Jenkins page. A minimized
+            window is worse: its rectangle collapses to 160x28 at -32000, so
+            the grab returns a black strip.
+            """
+            logger = live.get("logger")
+            if not window_capture_enabled or sys.platform != "win32":
+                return orig_capture(desktop_hwnd)
+            if not desktop_hwnd:
+                return orig_capture(desktop_hwnd)
+
+            user32 = ctypes.windll.user32
+            if restore_minimized and user32.IsIconic(desktop_hwnd):
+                # A minimized window has no full-size pixels to render, so it
+                # must come back first. SW_SHOWNOACTIVATE keeps the user's
+                # current window in front.
+                user32.ShowWindow(desktop_hwnd, 4)  # SW_SHOWNOACTIVATE
+                time.sleep(0.4)
+                capture_state["restored"] += 1
+                if logger is not None and capture_state["restored"] <= 3:
+                    logger.info(
+                        "Jenkins OCR: target window was minimized - restored "
+                        "without taking focus so it can be captured"
+                    )
+
+            try:
+                image = _print_window_client_image(desktop_hwnd)
+            except Exception as exc:
+                image = None
+                if logger is not None and capture_state["grabbed"] < 1:
+                    logger.info(
+                        "Jenkins OCR: PrintWindow capture unavailable (%s) - "
+                        "falling back to screen grab",
+                        exc,
+                    )
+
+            if image is not None and not _is_uniform(image):
+                capture_state["printed"] += 1
+                if capture_state["printed"] == 1 and logger is not None:
+                    logger.info(
+                        "Jenkins OCR: capturing the window's own pixels via "
+                        "PrintWindow (%dx%d) - occluding windows can no longer "
+                        "be read by mistake",
+                        image.size[0],
+                        image.size[1],
+                    )
+                return image
+
+            # PrintWindow gave nothing usable (HDX can refuse to render the
+            # seamless proxy); fall back, but say so, and note whether the
+            # frame we are about to grab even belongs to the target window.
+            capture_state["grabbed"] += 1
+            if logger is not None and capture_state["grabbed"] <= 3:
+                on_top = _window_is_topmost_at_centre(desktop_hwnd)
+                if on_top is False:
+                    capture_state["occluded"] += 1
+                    logger.warning(
+                        "Jenkins OCR: PrintWindow returned %s and another "
+                        "window is on top - the screen grab may read the wrong "
+                        "window",
+                        "nothing" if image is None else "a blank frame",
+                    )
+                else:
+                    logger.info(
+                        "Jenkins OCR: PrintWindow returned %s - using the "
+                        "screen grab (target appears to be on top)",
+                        "nothing" if image is None else "a blank frame",
+                    )
+            return orig_capture(desktop_hwnd)
+
+        ns["_capture_viewer_client_image"] = _capture_viewer_client_image
+        # So the in-session maximize check below measures the same pixels.
+        capture_image = _capture_viewer_client_image
 
     def _work_area_height():
         user32 = ctypes.windll.user32
