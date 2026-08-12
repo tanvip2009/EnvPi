@@ -174,6 +174,30 @@ Overrides (see ``_apply_overrides``):
     ``ENVPILOT_WINDOW_CAPTURE=0``, keep windows untouched with
     ``ENVPILOT_RESTORE_MINIMIZED=0``.
 
+14. ``_jenkins_click_build_submit`` runs a pre-submit OCR guard immediately
+    before the Build click. The 12 Aug 13:22 deploy logged
+    ``could not select ENVIRONMENT_NAME = SIT5``, captured
+    ``jenkins_before_build_133110.png`` with ``sitiv`` (garbled ``SIT1``) still
+    on screen, then logged ``Build submitted.`` anyway — a real deploy went to
+    the wrong environment while the GUI reported success. Dropdown failures were
+    only WARNED and their return values discarded in
+    ``_fill_jenkins_ocr_parameters``; nothing re-checked the page before
+    ``_jenkins_click_build_submit``. The guard hooks that gap: after the
+    existing ``before_build`` dump (same function, next call is submit) it
+    re-reads every non-empty GUI parameter and aborts with ``RuntimeError`` on
+    any definite mismatch. Policy: (a) if OCR reads a value that clearly does
+    not match the request (e.g. requested ``SIT5``, observed ``sitiv`` /
+    ``SIT1``), abort; (b) if the select box is unreadable (common for narrow
+    ``ProjectName``), crop the region below the label (left edge + ~0.031 cy
+    offset, matching override 8) and re-OCR before deciding; (c) if still
+    inconclusive, allow submit — OCR silence is not proof of a wrong value, and
+    the 12 Aug run showed ``ProjectName`` verification failed while ``OGW`` was
+    genuinely on screen. Fields that logged ``could not select`` are still
+    checked, but only abort when a conflicting value is read, not when the
+    token is absent. ``SIT*`` environment tokens apply a small garble normalizer
+    (``sitiv`` → ``sit1``) so a matching environment is not rejected. Set
+    ``ENVPILOT_ABORT_ON_PARAM_MISMATCH=0`` to restore submit-anyway behaviour.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -189,8 +213,10 @@ succeeds, override 5 stands down so host-side resizing cannot undo it.
 """
 
 import ctypes
+import difflib
 import marshal
 import os
+import re
 import sys
 import time
 from ctypes import wintypes
@@ -261,6 +287,351 @@ def _enable_per_monitor_dpi_awareness():
 
 
 _DPI_MODE = _enable_per_monitor_dpi_awareness()
+
+# Jenkins Build-with-Parameters field layout (mirrors compiled constants).
+_JENKINS_PARAM_DROPDOWNS = (
+    ("ProjectName", ("ProjectName",)),
+    ("Release_name", ("Release_name", "Release")),
+    ("ENVIRONMENT_NAME", ("ENVIRONMENT_NAME", "ENVIRONMENT")),
+)
+_JENKINS_PARAM_TEXTFIELDS = (
+    ("FOLDER_NAME", ("FOLDER_NAME", "FOLDER")),
+    ("BuildNumber", ("BuildNumber",)),
+)
+_PARAM_VERIFY_LABEL_CONF = 15
+_PARAM_BAND_TOP = 0.012
+_PARAM_BAND_BOTTOM = 0.065
+_PARAM_SELECT_OFFSET = 0.031
+_PARAM_MATCH_RATIO = 0.92
+_PARAM_MISMATCH_RATIO = 0.85
+_SIT_ENV_RE = re.compile(r"^sit(\d+)$", re.IGNORECASE)
+
+
+def _param_verify_enabled():
+    return os.environ.get("ENVPILOT_ABORT_ON_PARAM_MISMATCH", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _ocr_words_from_image(image, ocr_tesseract_data, normalize_ocr, logger):
+    """Build the same word dict list ``_jenkins_ocr_read`` uses, from a PIL image."""
+    data = ocr_tesseract_data(image, logger)
+    if not data:
+        return []
+    width, height = image.size
+    words = []
+    for index, raw in enumerate(data.get("text") or []):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        box_w = int(data["width"][index])
+        box_h = int(data["height"][index])
+        if box_w <= 0 or box_h <= 0:
+            continue
+        left = int(data["left"][index])
+        top = int(data["top"][index])
+        conf_raw = data.get("conf", [0])
+        conf = int(float(conf_raw[index] if index < len(conf_raw) else 0) or 0)
+        words.append(
+            {
+                "text": text,
+                "norm": normalize_ocr(text),
+                "cx": (left + box_w / 2) / width,
+                "cy": (top + box_h / 2) / height,
+                "x1": (left + box_w) / width,
+                "conf": conf,
+                "line": int(data.get("line_num", [0])[index] or 0),
+            }
+        )
+    return words
+
+
+def _param_label_left_ratio(label, words, labels, normalize_ocr):
+    label_cy = label.get("cy")
+    if label_cy is None:
+        return None
+    wanted = {normalize_ocr(text) for text in labels if text}
+    wanted.discard("")
+    lefts = []
+    for word in words:
+        try:
+            row_cy = float(word["cy"])
+            x1 = float(word["x1"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(row_cy - float(label_cy)) > 0.015:
+            continue
+        norm = word.get("norm") or normalize_ocr(word.get("text") or "")
+        if norm and any(
+            norm == w
+            or (len(norm) >= 3 and norm in w)
+            or (len(w) >= 3 and w in norm)
+            for w in wanted
+        ):
+            cx = float(word["cx"])
+            left_edge = max(0.0, 2.0 * cx - (x1 if x1 <= 1.0 else x1))
+            lefts.append(left_edge)
+    if lefts:
+        return min(lefts)
+    if label.get("cx") is not None:
+        try:
+            return max(0.0, float(label["cx"]) - 0.03)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _param_band_words(words, label, labels, normalize_ocr):
+    label_cy = label.get("cy")
+    if label_cy is None:
+        return []
+    left_ratio = _param_label_left_ratio(label, words, labels, normalize_ocr)
+    lo_cy = float(label_cy) + _PARAM_BAND_TOP
+    hi_cy = float(label_cy) + _PARAM_BAND_BOTTOM
+    band = []
+    for word in words:
+        try:
+            cy = float(word["cy"])
+            cx = float(word["cx"])
+            conf = int(word.get("conf") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if conf < _PARAM_VERIFY_LABEL_CONF:
+            continue
+        if cy < lo_cy or cy > hi_cy:
+            continue
+        if left_ratio is not None and not (left_ratio - 0.02 <= cx <= left_ratio + 0.28):
+            continue
+        band.append(word)
+    return sorted(band, key=lambda w: (w["cy"], w["cx"]))
+
+
+def _param_join_band(band):
+    return "".join(w.get("text") or "" for w in band).strip()
+
+
+def _param_normalize_sit_garble(norm):
+    """Map common OCR garble on Jenkins SIT environment selects (sitiv -> sit1)."""
+    lowered = (norm or "").lower()
+    if not lowered.startswith("sit"):
+        return lowered
+    tail = lowered[3:]
+    digit_run = re.sub(r"[^0-9]", "", tail)
+    if digit_run:
+        return "sit" + digit_run
+    if tail.endswith(("v", "l")) or tail in ("iv", "1v", "i"):
+        return "sit1"
+    return lowered
+
+
+def _param_values_match(observed_norm, requested_norm, normalize_ocr):
+    observed = (observed_norm or "").strip()
+    requested = normalize_ocr(requested_norm or "")
+    if not requested:
+        return True
+    if not observed:
+        return False
+    observed = normalize_ocr(observed)
+    if observed == requested:
+        return True
+    if difflib.SequenceMatcher(None, observed, requested).ratio() >= _PARAM_MATCH_RATIO:
+        return True
+    if len(requested) >= 4 and (requested in observed or observed in requested):
+        return True
+    req_sit = _SIT_ENV_RE.match(requested)
+    if req_sit:
+        obs_sit = _SIT_ENV_RE.match(_param_normalize_sit_garble(observed))
+        if obs_sit and obs_sit.group(1) == req_sit.group(1):
+            return True
+    return False
+
+
+def _param_confident_mismatch(observed_norm, requested_norm, normalize_ocr):
+    observed = normalize_ocr(observed_norm or "")
+    requested = normalize_ocr(requested_norm or "")
+    if not observed or not requested:
+        return False, observed
+    if _param_values_match(observed, requested, normalize_ocr):
+        return False, observed
+    req_sit = _SIT_ENV_RE.match(requested)
+    if req_sit:
+        obs_sit = _SIT_ENV_RE.match(_param_normalize_sit_garble(observed))
+        if obs_sit and obs_sit.group(1) != req_sit.group(1):
+            return True, observed
+        if obs_sit and obs_sit.group(1) == req_sit.group(1):
+            return False, observed
+    if len(observed) >= 3 and difflib.SequenceMatcher(
+        None, observed, requested
+    ).ratio() < _PARAM_MISMATCH_RATIO:
+        return True, observed
+    if len(observed) >= 2 and observed != requested:
+        return True, observed
+    return False, observed
+
+
+def _param_crop_reread(image, label, labels, normalize_ocr, ocr_tesseract_data, logger):
+    left_ratio = _param_label_left_ratio(
+        label, _ocr_words_from_image(image, ocr_tesseract_data, normalize_ocr, logger),
+        labels,
+        normalize_ocr,
+    )
+    try:
+        label_cy = float(label["cy"])
+    except (KeyError, TypeError, ValueError):
+        return []
+    width, height = image.size
+    anchor_left = left_ratio
+    if anchor_left is None:
+        try:
+            anchor_left = max(0.0, float(label.get("cx", 0.2)) - 0.03)
+        except (TypeError, ValueError):
+            anchor_left = 0.2
+    x0 = int(max(0, (anchor_left - 0.01) * width))
+    y0 = int(max(0, (label_cy + _PARAM_BAND_TOP) * height))
+    x1 = int(min(width, x0 + 0.35 * width))
+    y1 = int(min(height, y0 + 0.055 * height))
+    if x1 <= x0 or y1 <= y0:
+        return []
+    crop = image.crop((x0, y0, x1, y1))
+    return _ocr_words_from_image(crop, ocr_tesseract_data, normalize_ocr, logger)
+
+
+def _param_verify_field(
+    words,
+    image,
+    field_key,
+    labels,
+    requested,
+    had_select_failure,
+    find_any,
+    normalize_ocr,
+    ocr_tesseract_data,
+    logger,
+):
+    """Return (status, observed_display) where status is ok|mismatch|inconclusive."""
+    if not requested:
+        return "ok", requested
+    label = None
+    if callable(find_any):
+        try:
+            label, _which = find_any(
+                words, labels, min_conf=_PARAM_VERIFY_LABEL_CONF
+            )
+        except TypeError:
+            label, _which = find_any(words, labels)
+    if not label:
+        return "inconclusive", None
+
+    band = _param_band_words(words, label, labels, normalize_ocr)
+    observed_raw = _param_join_band(band)
+    observed_norm = normalize_ocr(observed_raw) if observed_raw else ""
+
+    if _param_values_match(observed_norm, requested, normalize_ocr):
+        return "ok", observed_raw or requested
+
+    mismatch, mismatch_obs = _param_confident_mismatch(
+        observed_norm, requested, normalize_ocr
+    )
+    if mismatch:
+        return "mismatch", mismatch_obs or observed_raw
+
+    crop_words = _param_crop_reread(
+        image, label, labels, normalize_ocr, ocr_tesseract_data, logger
+    )
+    crop_observed = _param_join_band(
+        sorted(crop_words, key=lambda w: (w["cy"], w["cx"]))
+    )
+    crop_norm = normalize_ocr(crop_observed) if crop_observed else ""
+
+    if _param_values_match(crop_norm, requested, normalize_ocr):
+        return "ok", crop_observed or requested
+
+    mismatch2, mismatch_obs2 = _param_confident_mismatch(
+        crop_norm, requested, normalize_ocr
+    )
+    if mismatch2:
+        return "mismatch", mismatch_obs2 or crop_observed
+
+    if had_select_failure and (observed_norm or crop_norm):
+        return "mismatch", observed_raw or crop_observed or observed_norm
+
+    return "inconclusive", observed_raw or crop_observed or None
+
+
+def _collect_param_requests(deploy_form):
+    requests = []
+    form = deploy_form or {}
+    for field_key, labels in _JENKINS_PARAM_DROPDOWNS + _JENKINS_PARAM_TEXTFIELDS:
+        value = str(form.get(field_key) or "").strip()
+        if value:
+            requests.append((field_key, labels, value))
+    return requests
+
+
+def _verify_jenkins_params_before_submit(
+    image,
+    words,
+    deploy_form,
+    select_failures,
+    find_any,
+    normalize_ocr,
+    ocr_tesseract_data,
+    logger,
+):
+    """Raise RuntimeError when any requested parameter clearly mismatches the screen."""
+    mismatches = []
+    for field_key, labels, requested in _collect_param_requests(deploy_form):
+        status, observed = _param_verify_field(
+            words,
+            image,
+            field_key,
+            labels,
+            requested,
+            field_key in (select_failures or set()),
+            find_any,
+            normalize_ocr,
+            ocr_tesseract_data,
+            logger,
+        )
+        if status == "mismatch":
+            mismatches.append((field_key, requested, observed))
+        elif logger is not None and status == "inconclusive":
+            logger.info(
+                "Jenkins OCR: pre-submit check inconclusive for %s "
+                "(requested %s%s) — OCR could not read the control; "
+                "allowing submit",
+                field_key,
+                requested,
+                " after could-not-select" if field_key in (select_failures or set()) else "",
+            )
+
+    if not mismatches:
+        return
+
+    parts = []
+    for field_key, requested, observed in mismatches:
+        if observed:
+            parts.append(
+                "{}: requested {}, observed {}".format(field_key, requested, observed)
+            )
+        else:
+            parts.append(
+                "{}: requested {}, could not read on-screen value".format(
+                    field_key, requested
+                )
+            )
+    message = (
+        "Jenkins build aborted: parameter mismatch before submit — "
+        + "; ".join(parts)
+        + ". Fix the field(s) on the Jenkins page or set "
+        "ENVPILOT_ABORT_ON_PARAM_MISMATCH=0 to restore submit-anyway "
+        "behaviour (not recommended)."
+    )
+    if logger is not None:
+        logger.error(message)
+    raise RuntimeError(message)
 
 
 def _apply_overrides(ns):
@@ -562,7 +933,13 @@ def _apply_overrides(ns):
 
     # Last handle known to be alive, and the last logger seen, so the handle
     # recovery below can report itself even from call sites that take no logger.
-    live = {"hwnd": None, "logger": None, "recoveries": 0}
+    live = {
+        "hwnd": None,
+        "logger": None,
+        "recoveries": 0,
+        "deploy_form": None,
+        "param_select_failures": set(),
+    }
 
     def _live_hwnd(hwnd):
         """Return a valid Edge handle, re-resolving if the given one is dead.
@@ -1223,6 +1600,8 @@ def _apply_overrides(ns):
             if not result:
                 edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
                 field_key = _arg(args, kwargs, 3, "field_key", "dropdown")
+                if field_key:
+                    live["param_select_failures"].add(field_key)
                 if callable(ocr_dump):
                     try:
                         ocr_dump(
@@ -1235,6 +1614,69 @@ def _apply_overrides(ns):
             return result
 
         ns["_jenkins_ocr_select_dropdown"] = _jenkins_ocr_select_dropdown
+
+    orig_fill_params = ns.get("_fill_jenkins_ocr_parameters")
+    orig_click_submit = ns.get("_jenkins_click_build_submit")
+    ocr_tesseract_data = ns.get("_ocr_tesseract_data")
+
+    if callable(orig_fill_params):
+
+        def _fill_jenkins_ocr_parameters(*args, **kwargs):
+            deploy_form = _arg(args, kwargs, 1, "deploy_form")
+            logger = _arg(args, kwargs, 2, "logger")
+            if logger is not None:
+                live["logger"] = logger
+            live["deploy_form"] = dict(deploy_form or {})
+            live["param_select_failures"] = set()
+            return orig_fill_params(*args, **kwargs)
+
+        ns["_fill_jenkins_ocr_parameters"] = _fill_jenkins_ocr_parameters
+
+    if (
+        callable(orig_click_submit)
+        and callable(orig_read)
+        and callable(ocr_tesseract_data)
+        and callable(normalize_ocr)
+        and callable(find_any)
+    ):
+
+        def _jenkins_click_build_submit(*args, **kwargs):
+            edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
+            logger = _arg(args, kwargs, 1, "logger")
+            if logger is not None:
+                live["logger"] = logger
+            if _param_verify_enabled() and live.get("deploy_form") is not None:
+                try:
+                    image, words = orig_read(_live_hwnd(edge_hwnd), logger)
+                except Exception as exc:
+                    if logger is not None:
+                        logger.warning(
+                            "Jenkins OCR: pre-submit parameter check skipped "
+                            "(capture/OCR failed: %s)",
+                            exc,
+                        )
+                else:
+                    if image is not None and words is not None:
+                        if logger is not None:
+                            logger.info(
+                                "Jenkins OCR: pre-submit parameter verification "
+                                "(%d OCR tokens, %d prior could-not-select)",
+                                len(words),
+                                len(live.get("param_select_failures") or ()),
+                            )
+                        _verify_jenkins_params_before_submit(
+                            image,
+                            words,
+                            live["deploy_form"],
+                            live.get("param_select_failures"),
+                            find_any,
+                            normalize_ocr,
+                            ocr_tesseract_data,
+                            logger,
+                        )
+            return orig_click_submit(*args, **kwargs)
+
+        ns["_jenkins_click_build_submit"] = _jenkins_click_build_submit
 
     orig_mfa_wait = ns.get("_wait_for_mfa_verification")
     mfa_page_visible = ns.get("_mfa_approval_page_visible")
