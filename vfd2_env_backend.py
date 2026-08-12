@@ -73,14 +73,31 @@ Overrides (see ``_apply_overrides``):
    finally showed the anchor firing but still "via cx estimate": the word scan
    looked for ``top``/``height``/``left``, none of which this build's word
    dicts contain — they carry ``("text", "norm", "cx", "cy", "x1", "conf",
-   "line")`` — so it always fell through to the estimate, which lands at 22.5%
-   against a select spanning 21.6-24.5%, only 0.3% inside. Matching the row on
-   ``cy`` and reading ``x1`` puts the click at 23.1%. The click also missed
-   *vertically*: the compiled offset is label_cy + 4%, but each select sits
-   ~3.2% below its own label and is only ~15px tall, so the click landed on its
-   bottom border (measured 38.0% against a box of 35.6-38.1%). The anchor is
-   lifted by ``ENVPILOT_DROPDOWN_CY_LIFT`` (default 0.01) so the click lands at
-   37.0%, near the 36.8% centre. Set it to 0 to restore the original aim.
+   "line")`` with no separate left/width keys. In this build ``x1`` is the
+   word's *right* edge as a ratio (bytecode: ``x1 = (left + width) / img_w``),
+   not the left edge the first override comment assumed; the true left edge is
+   ``2*cx - x1`` (Aug 12 capture: ProjectName x1=0.265 matches pixel-right
+   0.264, ``2*cx-x1``=0.216 matches pixel-left 0.217). A loose ``norm in w``
+   row match also let sidebar tokens such as ``"a"`` match ``environmentname``
+   and win ``min(lefts)``, producing the logged ``cx 0.259 -> 0.106`` without
+   any x1 misread. Matching now requires length >= 3 for substring tests, and
+   the left edge is recovered from ``2*cx - x1`` before the compiled ``+ 3%``
+   click offset. The click also missed *vertically*: cf42a0a added
+   ``ENVPILOT_DROPDOWN_CY_LIFT`` (default 0.01),
+   subtracting it from the label ``cy`` before the compiled ``+ 4%`` click
+   offset runs. That moved the aim *upward* toward the label text, but every
+   ``<select>`` sits *below* its label — measured on four saved captures
+   (1920x1116) the select centre is label_cy +0.030 to +0.036, while the lift
+   pushed the pre-offset anchor to label_cy −0.01 (log line ``cy 0.344 ->
+   0.334``). The compiled ``+ 4%`` only partly compensates; Release_name needs
+   the largest gap (+0.036) and ProjectName's value is often too small for OCR,
+   so a single constant misses it. The override now *drops* the anchor toward
+   the select: it prefers a label-to-select offset derived from OCR words in the
+   column below the label (e.g. ``4000_WAVE11_PCK1`` at cy 0.459 under
+   Release_name), and falls back to ``ENVPILOT_DROPDOWN_CY_DROP`` (default
+   0.031, the measured mean). ``ENVPILOT_DROPDOWN_CY_LIFT`` is still honoured
+   when ``DROP`` is unset (``drop = 0.04 − lift``) so the previous aim can be
+   restored. The shifted ``cy`` is clamped to 0.01..0.99 before ``+ 4%``.
 
 9. ``_wait_for_mfa_verification`` polls for the Microsoft MFA page to appear
    before concluding it is absent. The original checked visibility once, about
@@ -965,12 +982,27 @@ def _apply_overrides(ns):
     orig_select = ns.get("_jenkins_ocr_select_dropdown")
     normalize_ocr = ns.get("_normalize_ocr_text")
 
-    try:
-        dropdown_cy_lift = float(
-            os.environ.get("ENVPILOT_DROPDOWN_CY_LIFT", "0.01")
-        )
-    except ValueError:
-        dropdown_cy_lift = 0.01
+    # Compiled _jenkins_ocr_select_dropdown adds this to the revealed label cy.
+    _COMPILED_DROPDOWN_CY_OFFSET = 0.04
+    # Offline-measured label-cy -> select-centre gap (1920x1116 captures, Aug 12).
+    _DEFAULT_LABEL_TO_SELECT_OFFSET = 0.031
+
+    if "ENVPILOT_DROPDOWN_CY_DROP" in os.environ:
+        try:
+            dropdown_label_to_select = float(
+                os.environ["ENVPILOT_DROPDOWN_CY_DROP"]
+            )
+        except ValueError:
+            dropdown_label_to_select = _DEFAULT_LABEL_TO_SELECT_OFFSET
+    elif "ENVPILOT_DROPDOWN_CY_LIFT" in os.environ:
+        try:
+            dropdown_cy_lift = float(os.environ["ENVPILOT_DROPDOWN_CY_LIFT"])
+        except ValueError:
+            dropdown_cy_lift = 0.01
+        # Legacy: final click was (label_cy - lift + 0.04); express as drop offset.
+        dropdown_label_to_select = _COMPILED_DROPDOWN_CY_OFFSET - dropdown_cy_lift
+    else:
+        dropdown_label_to_select = _DEFAULT_LABEL_TO_SELECT_OFFSET
 
     def _norm_text(value):
         if callable(normalize_ocr):
@@ -1002,7 +1034,8 @@ def _apply_overrides(ns):
             for word in words:
                 # This build's word dicts carry ("text", "norm", "cx", "cy",
                 # "x1", "conf", "line") — no top/height/left — so the row is
-                # matched on "cy" and the left edge read from "x1".
+                # matched on "cy". x1 is the RIGHT edge (left+width)/img_w;
+                # recover the left edge as 2*cx-x1 for anchoring.
                 try:
                     row_cy = float(word["cy"])
                     x1 = float(word["x1"])
@@ -1011,9 +1044,18 @@ def _apply_overrides(ns):
                 if abs(row_cy - float(label_cy)) > 0.015:
                     continue
                 norm = _norm_text(word.get("norm") or word.get("text") or "")
-                if norm and any(norm == w or norm in w for w in wanted):
-                    # Ratios and raw pixels are both tolerated.
-                    lefts.append(x1 if x1 <= 1.0 else x1 / float(img_w))
+                if norm and any(
+                    norm == w or (len(norm) >= 3 and norm in w) or (len(w) >= 3 and w in norm)
+                    for w in wanted
+                ):
+                    # x1 is the word's RIGHT edge in this build; recover left edge.
+                    try:
+                        cx = float(word["cx"])
+                        right = x1 if x1 <= 1.0 else x1 / float(img_w)
+                        left_edge = max(0.0, 2.0 * cx - right)
+                    except (TypeError, ValueError):
+                        left_edge = x1 if x1 <= 1.0 else x1 / float(img_w)
+                    lefts.append(left_edge)
             if lefts:
                 left_ratio = min(lefts)
                 label_cx = label.get("cx")
@@ -1043,6 +1085,67 @@ def _apply_overrides(ns):
                 pass
 
         return None, "no usable label geometry"
+
+    def _estimate_label_to_select_offset(label, words, labels):
+        """Distance from label cy to select-centre cy, from OCR words below the label."""
+        label_cy = label.get("cy")
+        if label_cy is None or not words:
+            return None, None
+        left_ratio, _source = _label_left_ratio(label, words, labels)
+        if left_ratio is None and label.get("cx") is not None:
+            try:
+                left_ratio = max(0.0, float(label["cx"]) - 0.03)
+            except (TypeError, ValueError):
+                left_ratio = None
+        select_centres = []
+        for word in words:
+            try:
+                word_cy = float(word["cy"])
+                word_cx = float(word["cx"])
+                conf = int(word.get("conf") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if conf < 20:
+                continue
+            if word_cy <= float(label_cy) + 0.012:
+                continue
+            if word_cy > float(label_cy) + 0.065:
+                continue
+            if left_ratio is not None and abs(word_cx - (left_ratio + 0.03)) > 0.10:
+                continue
+            norm = _norm_text(word.get("norm") or word.get("text") or "")
+            wanted = {_norm_text(text) for text in (labels or ()) if text}
+            wanted.discard("")
+            if norm and any(
+                norm == w or (len(norm) >= 3 and norm in w) or (len(w) >= 3 and w in norm)
+                for w in wanted
+            ):
+                continue
+            select_centres.append(word_cy)
+        if not select_centres:
+            return None, None
+        centre = sum(select_centres) / len(select_centres)
+        return centre - float(label_cy), "OCR select value"
+
+    def _dropdown_shifted_cy(label, words, labels):
+        """Pre-compiled cy anchor: lands at label_cy + offset after +4%."""
+        label_cy_val = label.get("cy")
+        if label_cy_val is None:
+            return None, None, None
+        derived, derived_source = _estimate_label_to_select_offset(
+            label, words, labels
+        )
+        if derived is not None:
+            offset = derived
+            source = derived_source
+        else:
+            offset = dropdown_label_to_select
+            source = "configured drop default"
+        try:
+            shifted = float(label_cy_val) + offset - _COMPILED_DROPDOWN_CY_OFFSET
+        except (TypeError, ValueError):
+            return None, source, offset
+        return max(0.01, min(0.99, shifted)), source, offset
 
     if callable(orig_select):
 
@@ -1081,29 +1184,31 @@ def _apply_overrides(ns):
                     return label, words
                 shifted = dict(label)
                 shifted["cx"] = max(0.01, left_ratio - 0.015)
-                # The compiled click aims at label_cy + 4%, but every select
-                # measured on the params page sits ~3.2% below its own label
-                # and is only ~15px tall, so +4% lands on the bottom border or
-                # in the gap underneath. Lifting the anchor puts the click in
-                # the middle of the control.
+                # Each <select> sits below its label; the compiled path adds
+                # +4% to whatever cy _jenkins_reveal_label returns. Drop the
+                # anchor down to the measured select centre (derived from OCR
+                # words in the control when visible, else ENVPILOT_DROPDOWN_CY_DROP).
                 label_cy_val = label.get("cy")
-                if dropdown_cy_lift and label_cy_val is not None:
-                    try:
-                        shifted["cy"] = max(
-                            0.01, float(label_cy_val) - dropdown_cy_lift
-                        )
-                    except (TypeError, ValueError):
-                        pass
+                cy_source = None
+                cy_offset = None
+                if label_cy_val is not None:
+                    shifted_cy, cy_source, cy_offset = _dropdown_shifted_cy(
+                        label, words, labels
+                    )
+                    if shifted_cy is not None:
+                        shifted["cy"] = shifted_cy
                 if logger_ is not None:
                     logger_.info(
                         "Jenkins OCR: dropdown click anchored to label left "
-                        "edge via %s (cx %.3f -> %.3f, cy %.3f -> %.3f) so "
-                        "narrow selects are hit",
+                        "edge via %s (cx %.3f -> %.3f, cy %.3f -> %.3f, "
+                        "vertical %s offset %+.3f) so narrow selects are hit",
                         source,
                         label.get("cx", -1.0),
                         shifted["cx"],
                         label.get("cy", -1.0),
                         shifted.get("cy", label.get("cy", -1.0)),
+                        cy_source or "none",
+                        cy_offset if cy_offset is not None else 0.0,
                     )
                 return shifted, words
 
