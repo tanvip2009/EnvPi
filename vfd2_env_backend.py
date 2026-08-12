@@ -69,6 +69,18 @@ Overrides (see ``_apply_overrides``):
    raw OCR word dicts (which do keep pixel geometry) for the words on the
    label's own row, falls back to ``left`` and then to a ``cx`` estimate, and
    warns instead of failing silently when no geometry is usable.
+   Two further corrections came out of the 12 Aug 10:56 run, where the log
+   finally showed the anchor firing but still "via cx estimate": the word scan
+   looked for ``top``/``height``/``left``, none of which this build's word
+   dicts contain — they carry ``("text", "norm", "cx", "cy", "x1", "conf",
+   "line")`` — so it always fell through to the estimate, which lands at 22.5%
+   against a select spanning 21.6-24.5%, only 0.3% inside. Matching the row on
+   ``cy`` and reading ``x1`` puts the click at 23.1%. The click also missed
+   *vertically*: the compiled offset is label_cy + 4%, but each select sits
+   ~3.2% below its own label and is only ~15px tall, so the click landed on its
+   bottom border (measured 38.0% against a box of 35.6-38.1%). The anchor is
+   lifted by ``ENVPILOT_DROPDOWN_CY_LIFT`` (default 0.01) so the click lands at
+   37.0%, near the 36.8% centre. Set it to 0 to restore the original aim.
 
 9. ``_wait_for_mfa_verification`` polls for the Microsoft MFA page to appear
    before concluding it is absent. The original checked visibility once, about
@@ -725,6 +737,13 @@ def _apply_overrides(ns):
     orig_select = ns.get("_jenkins_ocr_select_dropdown")
     normalize_ocr = ns.get("_normalize_ocr_text")
 
+    try:
+        dropdown_cy_lift = float(
+            os.environ.get("ENVPILOT_DROPDOWN_CY_LIFT", "0.01")
+        )
+    except ValueError:
+        dropdown_cy_lift = 0.01
+
     def _norm_text(value):
         if callable(normalize_ocr):
             try:
@@ -748,25 +767,38 @@ def _apply_overrides(ns):
         img_h = live.get("img_h")
         label_cy = label.get("cy")
 
-        if img_w and img_h and words and label_cy is not None:
+        if img_w and words and label_cy is not None:
             wanted = {_norm_text(text) for text in (labels or ()) if text}
             wanted.discard("")
             lefts = []
             for word in words:
+                # This build's word dicts carry ("text", "norm", "cx", "cy",
+                # "x1", "conf", "line") — no top/height/left — so the row is
+                # matched on "cy" and the left edge read from "x1".
                 try:
-                    top = float(word["top"])
-                    height = float(word["height"])
-                    left = float(word["left"])
+                    row_cy = float(word["cy"])
+                    x1 = float(word["x1"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                row_cy = (top + height / 2.0) / float(img_h)
                 if abs(row_cy - float(label_cy)) > 0.015:
                     continue
                 norm = _norm_text(word.get("norm") or word.get("text") or "")
                 if norm and any(norm == w or norm in w for w in wanted):
-                    lefts.append(left)
+                    # Ratios and raw pixels are both tolerated.
+                    lefts.append(x1 if x1 <= 1.0 else x1 / float(img_w))
             if lefts:
-                return min(lefts) / float(img_w), "OCR word geometry"
+                left_ratio = min(lefts)
+                label_cx = label.get("cx")
+                # A left edge right of the label centre means the row match
+                # picked up the wrong word; the estimate below is safer.
+                sane = 0.0 <= left_ratio <= 1.0
+                if sane and label_cx is not None:
+                    try:
+                        sane = left_ratio <= float(label_cx) + 0.005
+                    except (TypeError, ValueError):
+                        pass
+                if sane:
+                    return left_ratio, "OCR word geometry"
 
         if img_w:
             try:
@@ -821,13 +853,29 @@ def _apply_overrides(ns):
                     return label, words
                 shifted = dict(label)
                 shifted["cx"] = max(0.01, left_ratio - 0.015)
+                # The compiled click aims at label_cy + 4%, but every select
+                # measured on the params page sits ~3.2% below its own label
+                # and is only ~15px tall, so +4% lands on the bottom border or
+                # in the gap underneath. Lifting the anchor puts the click in
+                # the middle of the control.
+                label_cy_val = label.get("cy")
+                if dropdown_cy_lift and label_cy_val is not None:
+                    try:
+                        shifted["cy"] = max(
+                            0.01, float(label_cy_val) - dropdown_cy_lift
+                        )
+                    except (TypeError, ValueError):
+                        pass
                 if logger_ is not None:
                     logger_.info(
                         "Jenkins OCR: dropdown click anchored to label left "
-                        "edge via %s (cx %.3f -> %.3f) so narrow selects are hit",
+                        "edge via %s (cx %.3f -> %.3f, cy %.3f -> %.3f) so "
+                        "narrow selects are hit",
                         source,
                         label.get("cx", -1.0),
                         shifted["cx"],
+                        label.get("cy", -1.0),
+                        shifted.get("cy", label.get("cy", -1.0)),
                     )
                 return shifted, words
 
