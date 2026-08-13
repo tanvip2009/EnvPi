@@ -198,37 +198,6 @@ Overrides (see ``_apply_overrides``):
     (``sitiv`` → ``sit1``) so a matching environment is not rejected. Set
     ``ENVPILOT_ABORT_ON_PARAM_MISMATCH=0`` to restore submit-anyway behaviour.
 
-15. ``_find_jenkins_edge_hwnd`` refuses to hand back a different application's
-    Citrix Edge window, and the capture refuses to OCR a covering window. The
-    compiled finder prefers a ``JENKINS``/``DEOSSKVR``/``SIGN IN`` title but
-    falls back to *any* seamless Edge window when none matches. A native
-    ``<select>`` popup destroys the Jenkins proxy window for a moment, so on
-    13 Aug 08:54:43 that fallback fired mid-dropdown and returned the user's
-    unrelated session::
-
-        no Jenkins-titled window; using seamless Edge 'OSF - Profile 1 - ...'
-        Edge handle 333492 was destroyed ... — recovered handle 6032946
-
-    The substituted handle stays alive forever, so it was cached and every
-    later click, retry and verification landed on an unrelated customer-search
-    page: the ``ENVIRONMENT_NAME`` "dropdown failure" screenshot is
-    ``osf-telesales-sit2.vodafone.de`` showing ``Kundensuche``, not Jenkins.
-    That is why dropdowns failed while text fields worked — only ``<select>``
-    popups recreate the window. The override now waits up to
-    ``ENVPILOT_JENKINS_WINDOW_WAIT`` seconds (default 20) for the real window
-    to return, discards an already-cached non-Jenkins handle, and gives up
-    rather than driving the wrong application. Strictness only engages once a
-    Jenkins-titled window has been seen, so the initial resolution — when the
-    remote Edge window is still on its start page — is unchanged. The capture
-    fallback in override 13 has the same failure: with ``PrintWindow``
-    returning nothing it screen-grabbed the rectangle and OCR'd whatever
-    covered it, which on 13 Aug 08:55:28 was the editor window
-    (``'EnvPi'``, ``'repository'``, ``'launch'``, ``'app'`` among 323 tokens).
-    It now returns ``None`` when another window is on top, which
-    ``_jenkins_ocr_read`` already turns into ``(None, [])`` for the callers to
-    retry. Set ``ENVPILOT_STRICT_JENKINS_WINDOW=0`` to restore the old
-    substitute-anything behaviour.
-
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -970,111 +939,7 @@ def _apply_overrides(ns):
         "recoveries": 0,
         "deploy_form": None,
         "param_select_failures": set(),
-        "jenkins_title": None,
-        "strict_giveup_until": 0.0,
     }
-
-    # Observed Jenkins window titles: 'Sign in [Jenkins] - ... - \\Remote' and
-    # '<job> [Jenkins] - ... - \\Remote'. DEOSSKVR is the Jenkins host, which
-    # is what the title shows while a tab is still loading.
-    _JENKINS_TITLE_MARKERS = ("JENKINS", "DEOSSKVR")
-
-    strict_jenkins_window = os.environ.get(
-        "ENVPILOT_STRICT_JENKINS_WINDOW", "1"
-    ).strip().lower() not in ("0", "false", "no")
-    try:
-        jenkins_window_wait = float(
-            os.environ.get("ENVPILOT_JENKINS_WINDOW_WAIT", "20")
-        )
-    except ValueError:
-        jenkins_window_wait = 20.0
-
-    def _window_title_upper(hwnd):
-        # Resolved from ns per call, so this always agrees with the title the
-        # compiled finder itself saw.
-        get_title = ns.get("_get_window_title")
-        if not hwnd or not callable(get_title):
-            return ""
-        try:
-            title = get_title(hwnd) or ""
-        except Exception:
-            return ""
-        normalize = ns.get("_normalize_window_title")
-        if callable(normalize):
-            try:
-                title = normalize(title) or title
-            except Exception:
-                pass
-        return title.upper()
-
-    def _is_jenkins_window(hwnd):
-        upper = _window_title_upper(hwnd)
-        if not upper:
-            return False
-        return any(marker in upper for marker in _JENKINS_TITLE_MARKERS)
-
-    def _seen_jenkins_window():
-        return live.get("jenkins_title") is not None
-
-    def _find_jenkins_window_strict(logger=None):
-        """Resolve the Jenkins window, never a different app's Edge window.
-
-        The compiled finder prefers a JENKINS/DEOSSKVR/SIGN IN title but, when
-        none is present, returns *any* Citrix seamless Edge window. A native
-        <select> popup destroys the Jenkins proxy window for a moment, and in
-        that window of time the fallback handed back a colleague application
-        (``OSF - Profile 1 - Microsoft Edge - \\\\Remote``), which was then
-        cached and driven for the rest of the run. Wait for the real window to
-        come back instead; it is only gone while the popup is up.
-        """
-        if logger is not None:
-            live["logger"] = logger
-        if not callable(orig_find_edge_hwnd):
-            return None
-        # _get_client_area_screen_point runs this on every click, scroll and
-        # capture, so a real outage must not cost the full wait each time.
-        if time.time() < live.get("strict_giveup_until", 0.0):
-            return None
-        deadline = time.time() + jenkins_window_wait
-        warned = False
-        while True:
-            try:
-                candidate = orig_find_edge_hwnd(logger)
-            except Exception:
-                candidate = None
-            if candidate and _is_jenkins_window(candidate):
-                live["jenkins_title"] = _window_title_upper(candidate)
-                live["strict_giveup_until"] = 0.0
-                return candidate
-            # Before Jenkins has ever been on screen the remote Edge window is
-            # still on its start page, so the permissive choice is all there is.
-            if not strict_jenkins_window or not _seen_jenkins_window():
-                return candidate
-            if logger is not None and not warned:
-                warned = True
-                logger.warning(
-                    "Jenkins OCR: refusing to drive %r - it is not the Jenkins "
-                    "window; waiting up to %.0fs for the Jenkins window to "
-                    "come back (a native dropdown popup recreates it)",
-                    _window_title_upper(candidate) or candidate,
-                    jenkins_window_wait,
-                )
-            if time.time() >= deadline:
-                live["strict_giveup_until"] = time.time() + jenkins_window_wait
-                if logger is not None:
-                    logger.error(
-                        "Jenkins OCR: Jenkins window did not reappear within "
-                        "%.0fs; refusing to fall back to another application's "
-                        "Citrix Edge window",
-                        jenkins_window_wait,
-                    )
-                return None
-            time.sleep(0.5)
-
-    orig_find_edge_hwnd = find_edge_hwnd
-    if callable(orig_find_edge_hwnd):
-        ns["_find_jenkins_edge_hwnd"] = _find_jenkins_window_strict
-        find_edge_hwnd = _find_jenkins_window_strict
 
     def _live_hwnd(hwnd):
         """Return a valid Edge handle, re-resolving if the given one is dead.
@@ -1095,25 +960,7 @@ def _apply_overrides(ns):
             live["hwnd"] = hwnd
             return hwnd
         if live["hwnd"] and user32.IsWindow(live["hwnd"]):
-            # A handle recovered before this guard existed could be another
-            # application's window, and it stays alive forever, so the run
-            # never finds its way back to Jenkins. Drop it and re-resolve.
-            if (
-                strict_jenkins_window
-                and _seen_jenkins_window()
-                and not _is_jenkins_window(live["hwnd"])
-            ):
-                logger = live["logger"]
-                if logger is not None:
-                    logger.warning(
-                        "Jenkins OCR: discarding cached handle %r (%r) - not "
-                        "the Jenkins window",
-                        live["hwnd"],
-                        _window_title_upper(live["hwnd"]),
-                    )
-                live["hwnd"] = None
-            else:
-                return live["hwnd"]
+            return live["hwnd"]
         if not callable(find_edge_hwnd):
             return hwnd
         try:
@@ -1240,8 +1087,7 @@ def _apply_overrides(ns):
             return None
         return image.crop((off_x, off_y, off_x + client_w, off_y + client_h))
 
-    def _topmost_root_at_centre(hwnd):
-        """Root window actually drawn at the centre of hwnd's rectangle."""
+    def _window_is_topmost_at_centre(hwnd):
         user32 = ctypes.windll.user32
         rect = wintypes.RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -1252,7 +1098,8 @@ def _apply_overrides(ns):
         top = user32.WindowFromPoint(point)
         if not top:
             return None
-        return user32.GetAncestor(top, 2)  # GA_ROOT
+        root = user32.GetAncestor(top, 2)  # GA_ROOT
+        return bool(root == hwnd)
 
     if callable(capture_image) and Image is not None:
         window_capture_enabled = os.environ.get(
@@ -1318,30 +1165,25 @@ def _apply_overrides(ns):
                 return image
 
             # PrintWindow gave nothing usable (HDX can refuse to render the
-            # seamless proxy). The screen grab is only trustworthy when the
-            # target is genuinely the top window at that rectangle; otherwise
-            # it returns the covering window, and OCR happily reads it as the
-            # Jenkins page. _jenkins_ocr_read turns None into (None, []), which
-            # the callers already treat as "nothing readable, retry".
+            # seamless proxy); fall back, but say so, and note whether the
+            # frame we are about to grab even belongs to the target window.
             capture_state["grabbed"] += 1
-            reason = "nothing" if image is None else "a blank frame"
-            covering = _topmost_root_at_centre(desktop_hwnd)
-            if covering is not None and covering != desktop_hwnd:
-                capture_state["occluded"] += 1
-                if logger is not None and capture_state["occluded"] <= 5:
-                    logger.warning(
-                        "Jenkins OCR: PrintWindow returned %s and %r is on top "
-                        "- refusing to OCR the covering window; retrying",
-                        reason,
-                        _window_title_upper(covering) or covering,
-                    )
-                return None
             if logger is not None and capture_state["grabbed"] <= 3:
-                logger.info(
-                    "Jenkins OCR: PrintWindow returned %s - using the screen "
-                    "grab (target appears to be on top)",
-                    reason,
-                )
+                on_top = _window_is_topmost_at_centre(desktop_hwnd)
+                if on_top is False:
+                    capture_state["occluded"] += 1
+                    logger.warning(
+                        "Jenkins OCR: PrintWindow returned %s and another "
+                        "window is on top - the screen grab may read the wrong "
+                        "window",
+                        "nothing" if image is None else "a blank frame",
+                    )
+                else:
+                    logger.info(
+                        "Jenkins OCR: PrintWindow returned %s - using the "
+                        "screen grab (target appears to be on top)",
+                        "nothing" if image is None else "a blank frame",
+                    )
             return orig_capture(desktop_hwnd)
 
         ns["_capture_viewer_client_image"] = _capture_viewer_client_image
