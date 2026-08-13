@@ -229,31 +229,6 @@ Overrides (see ``_apply_overrides``):
     retry. Set ``ENVPILOT_STRICT_JENKINS_WINDOW=0`` to restore the old
     substitute-anything behaviour.
 
-16. The synthetic-keystroke primitives refuse to fire once the remote window is
-    gone, and the run aborts instead of continuing. Force-closing the session
-    used to leave the flow retrying against nothing. Clicks are already safe
-    when that happens — ``_get_client_area_screen_point`` returns ``None`` as
-    soon as ``GetClientRect`` fails, so no coordinate can be computed — but
-    keystrokes are not: ``_type_text_unicode``, ``_send_char_key``,
-    ``_send_enter_key`` and the rest call ``keybd_event`` with no window at
-    all, so they land wherever focus happens to be. A closed session could
-    therefore type a parameter value, or a login password, into whatever the
-    user had in front. Each primitive is wrapped to check first, raising
-    ``JenkinsWindowClosed`` when the Jenkins window has gone so the action ends
-    promptly with ``Action failed`` rather than spinning. The focus check
-    compares the *process* of the foreground window, not its handle: a native
-    ``<select>`` popup is its own top-level window and typing into it is
-    precisely what dropdown selection needs, so handle matching would break the
-    dropdowns while process matching still blocks local applications. The
-    guards apply only while ``_run_jenkins_ocr_deploy`` is running, so Citrix
-    login and the desktop flows, which legitimately drive other windows, are
-    untouched. ``_send_escape_key`` and ``_send_win_key`` are deliberately left
-    unguarded: they are used by the focus and maximize paths that run before a
-    target is established, and a stray Escape or Win tap is harmless. The
-    capture path performs the same check, since reads happen constantly and
-    notice a closed session soonest even on a path that never types. Set
-    ``ENVPILOT_ABORT_ON_WINDOW_CLOSE=0`` to disable.
-
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -997,13 +972,7 @@ def _apply_overrides(ns):
         "param_select_failures": set(),
         "jenkins_title": None,
         "strict_giveup_until": 0.0,
-        "jenkins_phase": False,
-        "key_guard_depth": 0,
     }
-
-    abort_on_window_close = os.environ.get(
-        "ENVPILOT_ABORT_ON_WINDOW_CLOSE", "1"
-    ).strip().lower() not in ("0", "false", "no")
 
     # Observed Jenkins window titles: 'Sign in [Jenkins] - ... - \\Remote' and
     # '<job> [Jenkins] - ... - \\Remote'. DEOSSKVR is the Jenkins host, which
@@ -1106,124 +1075,6 @@ def _apply_overrides(ns):
     if callable(orig_find_edge_hwnd):
         ns["_find_jenkins_edge_hwnd"] = _find_jenkins_window_strict
         find_edge_hwnd = _find_jenkins_window_strict
-
-    class JenkinsWindowClosed(RuntimeError):
-        """The remote window went away, so the run must stop immediately."""
-
-    def _process_of_window(hwnd):
-        if not hwnd:
-            return None
-        pid = wintypes.DWORD(0)
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return pid.value or None
-
-    def _current_jenkins_hwnd():
-        """The Jenkins window if it is still there, else None."""
-        user32 = ctypes.windll.user32
-        cached = live.get("hwnd")
-        if cached and user32.IsWindow(cached) and _is_jenkins_window(cached):
-            return cached
-        found = _find_jenkins_window_strict(live.get("logger"))
-        if found and user32.IsWindow(found):
-            live["hwnd"] = found
-            return found
-        return None
-
-    def _require_jenkins_window(what):
-        """Stop the run when the remote window is gone; never guess a target.
-
-        Clicks are inherently safe once the window dies because
-        ``_get_client_area_screen_point`` returns None when ``GetClientRect``
-        fails. Keystrokes are not: the ``keybd_event`` primitives take no
-        window and simply go wherever focus is, so a force-closed session
-        would send parameter values — or a password — into whatever the user
-        happens to have in front. Refuse instead, and abort the action.
-        """
-        if not (live.get("jenkins_phase") and abort_on_window_close):
-            return None
-        hwnd = _current_jenkins_hwnd()
-        if hwnd is None:
-            raise JenkinsWindowClosed(
-                "Jenkins window is gone (session closed or force-closed) - "
-                "aborting before {} so no input reaches another window".format(
-                    what
-                )
-            )
-        return hwnd
-
-    def _require_jenkins_input_target(what):
-        """Only type while the focused window belongs to the Citrix session.
-
-        Matching the foreground window by handle is too strict: a native
-        <select> popup is its own top-level window, and typing into it is
-        exactly what dropdown selection needs. Matching by *process* keeps
-        those popups working while still refusing to type into a local app.
-        """
-        hwnd = _require_jenkins_window(what)
-        if hwnd is None:
-            return
-        user32 = ctypes.windll.user32
-        foreground = user32.GetForegroundWindow()
-        if not foreground:
-            return
-        target_pid = _process_of_window(hwnd)
-        focus_pid = _process_of_window(foreground)
-        if target_pid and focus_pid and target_pid == focus_pid:
-            return
-        logger = live.get("logger")
-        if logger is not None:
-            logger.error(
-                "Jenkins OCR: %r has keyboard focus and it does not belong to "
-                "the Citrix session - refusing to send %s",
-                _window_title_upper(foreground) or foreground,
-                what,
-            )
-        raise JenkinsWindowClosed(
-            "keyboard focus left the Citrix session ({!r}) - aborting before "
-            "{} so no input reaches another window".format(
-                _window_title_upper(foreground) or foreground, what
-            )
-        )
-
-    # Every synthetic keystroke funnels through these; none of them takes a
-    # window, so each one is a chance to type into the wrong application.
-    _KEY_PRIMITIVES = (
-        "_type_text_unicode",
-        "_send_char_key",
-        "_send_arrow_key",
-        "_send_enter_key",
-        "_send_tab_key",
-        "_send_backspace_key",
-        "_send_delete_key",
-        "_send_ctrl_a",
-        "_send_ctrl_l",
-        "_send_ctrl_n",
-        "_send_ctrl_t",
-        "_send_ctrl_v",
-        "_send_alt_d",
-    )
-
-    def _guard_key_primitive(name, original):
-        def guarded(*args, **kwargs):
-            # _jenkins_focus and the guard's own recovery send keys too; do not
-            # re-enter the check from inside them.
-            if live.get("key_guard_depth"):
-                return original(*args, **kwargs)
-            live["key_guard_depth"] += 1
-            try:
-                _require_jenkins_input_target(name.lstrip("_"))
-            finally:
-                live["key_guard_depth"] -= 1
-            return original(*args, **kwargs)
-
-        guarded.__name__ = name
-        return guarded
-
-    if abort_on_window_close:
-        for _key_name in _KEY_PRIMITIVES:
-            _key_original = ns.get(_key_name)
-            if callable(_key_original):
-                ns[_key_name] = _guard_key_primitive(_key_name, _key_original)
 
     def _live_hwnd(hwnd):
         """Return a valid Edge handle, re-resolving if the given one is dead.
@@ -1428,9 +1279,6 @@ def _apply_overrides(ns):
                 return orig_capture(desktop_hwnd)
             if not desktop_hwnd:
                 return orig_capture(desktop_hwnd)
-            # Reads happen constantly, so this is where a force-closed session
-            # is noticed soonest, even on a path that never types.
-            _require_jenkins_window("the next screen read")
 
             user32 = ctypes.windll.user32
             if restore_minimized and user32.IsIconic(desktop_hwnd):
@@ -1662,13 +1510,7 @@ def _apply_overrides(ns):
                     logger.info(
                         "Jenkins OCR: in-session maximize skipped (%s)", exc
                     )
-            # The input guards only apply while this flow owns the keyboard;
-            # Citrix login and the desktop flows drive other windows legitimately.
-            live["jenkins_phase"] = True
-            try:
-                return orig_ocr_deploy(*args, **kwargs)
-            finally:
-                live["jenkins_phase"] = False
+            return orig_ocr_deploy(*args, **kwargs)
 
         ns["_run_jenkins_ocr_deploy"] = _run_jenkins_ocr_deploy
 
