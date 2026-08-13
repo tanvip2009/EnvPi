@@ -198,6 +198,31 @@ Overrides (see ``_apply_overrides``):
     (``sitiv`` → ``sit1``) so a matching environment is not rejected. Set
     ``ENVPILOT_ABORT_ON_PARAM_MISMATCH=0`` to restore submit-anyway behaviour.
 
+15. ``_open_new_citrix_edge_with_jenkins`` keeps retrying for focus instead of
+    letting Jenkins land in the user's existing window. The compiled version
+    focuses the window ``Ctrl+N`` just created, sleeps 0.8s, tests the
+    foreground once, and on a single miss logs
+    ``New Edge window not foreground (fg=...) — skipping paste`` and returns
+    False; ``_try_edge_app_deploy`` then loads Jenkins into the existing remote
+    Edge instead. On 13 Aug 10:25:46 a Teams chat window held the foreground
+    for that one moment, so Jenkins became one tab among six
+    (``Sign in [Jenkins] and 5 more pages``). That matters more than it looks:
+    an Edge window's title *and* captured content follow the active tab, so any
+    later tab switch silently points OCR and clicks at a different page. It is
+    the likeliest explanation for the 13 Aug 08:55 capture that showed
+    ``osf-telesales-sit2.vodafone.de`` under a ``dropdown_fail_ENVIRONMENT_NAME``
+    name, and for titles flipping between ``OSF``, ``Email to ID Request`` and
+    ``Sign in [Jenkins]`` within one run. Re-running the original is not an
+    option — each call spends another ``Ctrl+N`` and would leave orphan windows
+    — so the override finishes the job on the window already created, retrying
+    ``_focus_window_handle``/``_bring_window_to_front``
+    ``ENVPILOT_NEW_WINDOW_FOCUS_ATTEMPTS`` times (default 8, ~0.8s apart) and
+    only then pasting the URL. The foreground gate itself is kept exactly as
+    the compiled code had it, because it is what stops keystrokes going to the
+    Citrix desktop or another app; only the give-up-after-one-try is changed.
+    If nothing was created, the original is retried once, which cannot orphan a
+    window. Set ``ENVPILOT_JENKINS_OWN_WINDOW=0`` to restore the old behaviour.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -1331,6 +1356,185 @@ def _apply_overrides(ns):
                 before_h,
             )
         return False
+
+    orig_open_new_edge = ns.get("_open_new_citrix_edge_with_jenkins")
+
+    if callable(orig_open_new_edge):
+        own_window_enabled = os.environ.get(
+            "ENVPILOT_JENKINS_OWN_WINDOW", "1"
+        ).strip().lower() not in ("0", "false", "no")
+        try:
+            focus_attempts = int(
+                os.environ.get("ENVPILOT_NEW_WINDOW_FOCUS_ATTEMPTS", "8")
+            )
+        except ValueError:
+            focus_attempts = 8
+
+        def _session_edge_hwnds(logger):
+            lister = ns.get("_list_citrix_session_edge_hwnds")
+            if not callable(lister):
+                return set()
+            for call in (lambda: lister(), lambda: lister(logger)):
+                try:
+                    return set(call() or ())
+                except TypeError:
+                    continue
+                except Exception:
+                    return set()
+            return set()
+
+        def _window_title(hwnd):
+            get_title = ns.get("_get_window_title")
+            if not hwnd or not callable(get_title):
+                return ""
+            try:
+                return get_title(hwnd) or ""
+            except Exception:
+                return ""
+
+        def _new_window_is_foreground(new_hwnd):
+            """Same test the compiled code uses, so behaviour is unchanged."""
+            info = ns.get("_get_foreground_window_info")
+            seamless = ns.get("_is_citrix_seamless_edge_title")
+            if not callable(info):
+                return False, ""
+            try:
+                fg_hwnd, fg_title = info()
+            except Exception:
+                return False, ""
+            if fg_hwnd == new_hwnd:
+                return True, fg_title
+            if callable(seamless):
+                try:
+                    if seamless(fg_title):
+                        return True, fg_title
+                except Exception:
+                    pass
+            return False, fg_title
+
+        def _paste_jenkins_url(new_hwnd, logger):
+            """The tail of the compiled function, once the window is in front."""
+            url = ns.get("CITRIX_JENKINS_LOGIN_URL")
+            copy_clip = ns.get("_copy_to_clipboard_windows")
+            release = ns.get("_release_keyboard_modifiers")
+            ctrl_l = ns.get("_send_ctrl_l")
+            ctrl_v = ns.get("_send_ctrl_v")
+            enter = ns.get("_send_enter_key")
+            front = ns.get("_bring_window_to_front")
+            if not (url and callable(copy_clip) and callable(ctrl_l)
+                    and callable(ctrl_v) and callable(enter)):
+                return False
+            if not copy_clip(url, logger, label="jenkins login url"):
+                if logger is not None:
+                    logger.warning("Could not copy Jenkins URL to clipboard")
+                return False
+            if callable(release):
+                release()
+            ctrl_l()
+            time.sleep(0.5)
+            ctrl_v()
+            time.sleep(0.35)
+            enter()
+            if logger is not None:
+                logger.info(
+                    "Jenkins: recovered the new Edge window and loaded the "
+                    "Jenkins URL: %s",
+                    url,
+                )
+            time.sleep(5.0)
+            if callable(front):
+                front(new_hwnd, logger)
+            return True
+
+        def _open_new_citrix_edge_with_jenkins(*args, **kwargs):
+            """Keep Jenkins in its own window even if focus is stolen.
+
+            The compiled version focuses the window Ctrl+N just made, waits
+            0.8s, checks the foreground once, and on a single miss logs
+            ``New Edge window not foreground ... skipping paste`` and returns
+            False. The caller then falls back to loading Jenkins in the user's
+            existing window, where it becomes one tab among many — and an Edge
+            window's title and content follow the *active tab*, so any later
+            tab switch silently points OCR at the wrong page. That is what
+            happened on 13 Aug 10:25:46, when a Teams chat window held the
+            foreground for a moment.
+
+            Rather than re-running the original (every call spends another
+            Ctrl+N and would leave orphan windows), finish the job on the
+            window it already created, retrying the focus.
+            """
+            logger = _arg(args, kwargs, 2, "logger")
+            if not own_window_enabled:
+                return orig_open_new_edge(*args, **kwargs)
+            before = _session_edge_hwnds(logger)
+            result = orig_open_new_edge(*args, **kwargs)
+            if result:
+                return result
+
+            created = _session_edge_hwnds(logger) - before
+            if not created:
+                # Nothing was opened, so a plain retry cannot leave orphans.
+                if logger is not None:
+                    logger.info(
+                        "Jenkins: no new Edge window was created - retrying "
+                        "the open once"
+                    )
+                return orig_open_new_edge(*args, **kwargs)
+
+            user32 = ctypes.windll.user32
+            new_hwnd = max(created)
+            focus_window = ns.get("_focus_window_handle")
+            front = ns.get("_bring_window_to_front")
+            if logger is not None:
+                logger.warning(
+                    "Jenkins: new Edge window %r exists but the paste was "
+                    "skipped; retrying focus up to %d times so Jenkins keeps "
+                    "its own window instead of becoming a tab",
+                    _window_title(new_hwnd) or new_hwnd,
+                    focus_attempts,
+                )
+            for attempt in range(1, max(1, focus_attempts) + 1):
+                if not user32.IsWindow(new_hwnd):
+                    if logger is not None:
+                        logger.error(
+                            "Jenkins: the new Edge window disappeared while "
+                            "waiting for focus"
+                        )
+                    return False
+                if callable(focus_window):
+                    focus_window(new_hwnd, logger)
+                if callable(front):
+                    front(new_hwnd, logger)
+                time.sleep(0.8)
+                ok, fg_title = _new_window_is_foreground(new_hwnd)
+                if ok:
+                    if logger is not None:
+                        logger.info(
+                            "Jenkins: new Edge window came to the front on "
+                            "attempt %d - pasting the Jenkins URL",
+                            attempt,
+                        )
+                    return _paste_jenkins_url(new_hwnd, logger)
+                if logger is not None:
+                    logger.info(
+                        "Jenkins: new Edge window still not foreground "
+                        "(attempt %d/%d, fg=%r)",
+                        attempt,
+                        focus_attempts,
+                        fg_title,
+                    )
+            if logger is not None:
+                logger.error(
+                    "Jenkins: could not bring the new Edge window to the front "
+                    "after %d attempts - not typing, so no keystrokes reach "
+                    "another window",
+                    focus_attempts,
+                )
+            return False
+
+        ns["_open_new_citrix_edge_with_jenkins"] = (
+            _open_new_citrix_edge_with_jenkins
+        )
 
     if callable(orig_ocr_deploy):
 
