@@ -223,6 +223,78 @@ Overrides (see ``_apply_overrides``):
     If nothing was created, the original is retried once, which cannot orphan a
     window. Set ``ENVPILOT_JENKINS_OWN_WINDOW=0`` to restore the old behaviour.
 
+16. ``_jenkins_reveal_label`` waits for the scroll to stop before reporting a
+    label's position. The compiled version scrolls a label into view and OCRs
+    immediately, but Edge animates keyboard scrolling, so the geometry it
+    returns is often a mid-flight frame — and every click derived from it lands
+    where the row *was*. The 13 Aug 13:30 run shows this twice, in the same
+    numbers: ``ENVIRONMENT_NAME`` was measured at cy 0.753 while the row was
+    travelling from 0.86 to its resting 0.65, so the click at 0.784 missed the
+    select by ~10% of the page and the arrow keys that followed scrolled the
+    document instead (the "dropdown does not open, page scrolls down" report);
+    ``BuildNumber`` was measured near 0.90, clicked at 0.94, and by then the row
+    had settled at 0.84 with the *next* parameter's label ``BuildNummer`` at
+    0.94 — so the triple-click selected that label as page text (visible
+    highlighted in ``jenkins_before_build_133802.png``) and ``Ctrl+V`` went into
+    a non-editable area, leaving BuildNumber empty. The override captures until
+    two consecutive frames differ by ≤2% of the client area, re-OCRs, and
+    returns the re-found label only when the row actually moved (≥0.008), so a
+    still page keeps its original reading. Set ``ENVPILOT_SETTLE_SCROLL=0`` to
+    restore the old behaviour.
+
+17. ``_jenkins_ocr_select_dropdown`` reads the select back from the control
+    itself before accepting a success. The compiled arrow-scan confirms its own
+    progress with OCR of the whole 1920x1032 page, where a ~56x26px select is
+    unreadable: ``ENVIRONMENT_NAME`` showing ``SIT1`` came back as ``sitiv``
+    then ``sity``, close enough to garbage that the scan matched noise and
+    logged ``selected ENVIRONMENT_NAME = SIT5 (arrow-scan)`` against a control
+    it had never changed. The wrong value then survived to the submit guard,
+    which is the only reason the build did not run with SIT1. The override crops
+    the control's own region (label left edge, ``_PARAM_BAND_TOP``..
+    ``_PARAM_BAND_BOTTOM`` below the label) and OCRs it upscaled 4x, which
+    resolves the value cleanly; on a confident mismatch it turns the result into
+    a failure so the field is recorded in ``param_select_failures`` and override
+    14 can abort. Silence still means inconclusive, never failure. Set
+    ``ENVPILOT_VERIFY_DROPDOWN_READBACK=0`` to restore the old behaviour.
+
+18. ``_jenkins_ocr_select_dropdown`` skips a select that already holds the
+    requested value. Reading a ~60x30px value needs more than upscaling: Citrix
+    and Edge render with ClearType subpixel anti-aliasing, so every glyph edge
+    carries orange and blue fringes. Straight-stroked values survive luminance
+    conversion (``SIT1`` reads exactly) but round and diagonal strokes do not —
+    ``OGW`` dissolves into hollow outlines and Tesseract returned *nothing* for
+    it under every page-segmentation mode, which is why ProjectName has never
+    verified in any run. Collapsing to the darkest RGB channel and blurring the
+    fringes back together recovers it, so ``_control_crop_variants`` offers
+    luminance, darkest-channel and darkest-plus-blur renderings at ``--psm 7``
+    and the caller keeps whichever reading matches. Digits are then compared
+    exactly (``_digits_agree``): the fuzzy matcher scores
+    ``4000_WAVE11_PCK1`` and ``4000_WAVE11_PCK01`` above threshold, so a select
+    holding PCK1 was being accepted as PCK01. This is scoped to crop readings —
+    the full-page submit guard keeps its looser rules, where a stray ``0`` read
+    out of ``OMI`` would otherwise invent a mismatch. On 13 Aug 18:01 this would
+    have turned ProjectName from 3.5 minutes of clicking, typing and
+    option-cycling — on a field that already read ``OGW`` in the first capture —
+    into a single no-op. Set ``ENVPILOT_SKIP_CORRECT_DROPDOWN=0`` to disable.
+
+19. ``_jenkins_ocr_select_dropdown`` sets a select by type-ahead before falling
+    back to the compiled strategies. Strategy A types a filter then clicks the
+    option row that matches, but a native ``<select>`` popup is an OS window of
+    its own and never appears in the window-owned capture, so the only matching
+    text OCR can see is the value the closed select already displays. That is
+    why both clicks in the 18:01 log land on the identical point (23%, 38%): the
+    second reopens the box instead of choosing a row. Strategy B then steps
+    through options one at a time for ~2.5 minutes per attempt with the list
+    held open, which is also what gives the popup time to destroy the Citrix
+    seamless window (``handle 2888292 was destroyed`` → the run adopted an
+    unrelated ``AskVodafone`` Edge window). Escape closes the popup and leaves
+    the ``<select>`` focused, and Chromium type-ahead on a focused closed select
+    jumps straight to the matching option: one step, nothing left open, popup
+    lifetime ~0.4s instead of minutes. Enter is deliberately never sent — on a
+    parameter form that would submit the build. Unverified attempts return None
+    so the compiled routine still runs, making this strictly additive. Set
+    ``ENVPILOT_DIRECT_DROPDOWN=0`` to disable.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -247,11 +319,13 @@ import time
 from ctypes import wintypes
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageFilter
 except ImportError:
     # Only the window-owned capture below needs PIL directly; without it that
     # override stands down and the compiled ImageGrab path is used unchanged.
     Image = None
+    ImageChops = None
+    ImageFilter = None
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COMPILED = os.path.join(_HERE, "vfd2_env_backend_compiled.pyc")
@@ -330,6 +404,223 @@ _PARAM_SELECT_OFFSET = 0.031
 _PARAM_MATCH_RATIO = 0.92
 _PARAM_MISMATCH_RATIO = 0.85
 _SIT_ENV_RE = re.compile(r"^sit(\d+)$", re.IGNORECASE)
+
+# Scroll-settle (override 16) and small-control OCR (override 17) tuning.
+_SETTLE_TRIES = 6
+_SETTLE_PAUSE = 0.2
+_SETTLE_CHANGED_RATIO = 0.02
+_SETTLE_MIN_SHIFT = 0.008
+_SMALL_CONTROL_UPSCALE = 6
+_SMALL_CONTROL_BLUR = 0.6
+# --psm 7 treats the crop as one text line; the whitelist keeps the <select>
+# chevron from being read as a stray letter.
+_SMALL_CONTROL_CONFIG = (
+    "--psm 7 -c tessedit_char_whitelist="
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _scroll_settle_enabled():
+    return os.environ.get("ENVPILOT_SETTLE_SCROLL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _dropdown_readback_enabled():
+    return os.environ.get("ENVPILOT_VERIFY_DROPDOWN_READBACK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _dropdown_skip_enabled():
+    return os.environ.get("ENVPILOT_SKIP_CORRECT_DROPDOWN", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _direct_dropdown_enabled():
+    return os.environ.get("ENVPILOT_DIRECT_DROPDOWN", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _images_settled(first, second):
+    """True when two captures differ only in a small region (e.g. a text caret).
+
+    Used to tell "the scroll animation has finished" from "the page is still
+    moving": a scroll repaints nearly the whole client area, while a blinking
+    caret or a spinner changes a sliver of it.
+    """
+    if ImageChops is None or first is None or second is None:
+        return False
+    if first.size != second.size:
+        return False
+    try:
+        bbox = ImageChops.difference(
+            first.convert("L"), second.convert("L")
+        ).getbbox()
+    except Exception:
+        return False
+    if bbox is None:
+        return True
+    total = float(first.size[0] * first.size[1])
+    if total <= 0:
+        return False
+    changed = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+    return (changed / total) <= _SETTLE_CHANGED_RATIO
+
+
+def _wait_until_settled(capture, hwnd, logger):
+    """Capture until two consecutive frames match; return the settled frame."""
+    previous = None
+    image = None
+    for _ in range(_SETTLE_TRIES):
+        try:
+            image = capture(hwnd)
+        except Exception:
+            return None
+        if image is None:
+            return None
+        if previous is not None and _images_settled(previous, image):
+            return image
+        previous = image
+        time.sleep(_SETTLE_PAUSE)
+    if logger is not None:
+        logger.info(
+            "Jenkins OCR: page still repainting after %.1fs — measuring the "
+            "last frame anyway",
+            _SETTLE_TRIES * _SETTLE_PAUSE,
+        )
+    return image
+
+
+def _crop_control_region(image, box):
+    """Crop a ratio box out of a capture, clamped to the image."""
+    if Image is None or image is None or not box:
+        return None
+    width, height = image.size
+    x0 = int(max(0, min(width - 1, box[0] * width)))
+    y0 = int(max(0, min(height - 1, box[1] * height)))
+    x1 = int(max(x0 + 1, min(width, box[2] * width)))
+    y1 = int(max(y0 + 1, min(height, box[3] * height)))
+    return image.crop((x0, y0, x1, y1)).convert("RGB")
+
+
+def _control_crop_variants(region):
+    """Yield de-fringed renderings of a small control crop.
+
+    Citrix/Edge render text with ClearType subpixel anti-aliasing, so every
+    glyph edge carries orange and blue fringes. Straight-stroked values survive
+    a plain luminance conversion — ``SIT1`` reads exactly — but round and
+    diagonal strokes do not: ``OGW`` dissolves into hollow, colour-noised
+    outlines and Tesseract returned *nothing at all* for it under every
+    page-segmentation mode, which is why ProjectName has never once verified.
+    Collapsing to the darkest channel and blurring the fringes back together
+    recovers ``OGW``, while plain luminance stays best for ``SIT1``, and the
+    darkest channel alone is best for ``Release_name``. No single recipe wins,
+    so all three are offered and the caller keeps whichever reading matches.
+    """
+    yield region.convert("L")
+    if ImageChops is None:
+        return
+    red, green, blue = region.split()
+    darkest = ImageChops.darker(ImageChops.darker(red, green), blue)
+    yield darkest
+    if ImageFilter is not None:
+        yield darkest.filter(ImageFilter.GaussianBlur(_SMALL_CONTROL_BLUR))
+
+
+def _prepare_for_ocr(prepped):
+    """Upscale and pad one rendering; Tesseract needs margin around the text."""
+    upscaled = prepped.resize(
+        (
+            prepped.width * _SMALL_CONTROL_UPSCALE,
+            prepped.height * _SMALL_CONTROL_UPSCALE,
+        ),
+        Image.LANCZOS,
+    )
+    padded = Image.new("L", (upscaled.width + 40, upscaled.height + 40), 255)
+    padded.paste(upscaled.convert("L"), (20, 20))
+    return padded
+
+
+def _read_control_readings(image, box, configure_tesseract, logger):
+    """Return the distinct OCR readings of one small control region."""
+    if Image is None:
+        return []
+    region = _crop_control_region(image, box)
+    if region is None:
+        return []
+    if callable(configure_tesseract) and not configure_tesseract(logger):
+        return []
+    try:
+        import pytesseract
+    except ImportError:
+        return []
+
+    readings = []
+    for prepped in _control_crop_variants(region):
+        try:
+            text = pytesseract.image_to_string(
+                _prepare_for_ocr(prepped), config=_SMALL_CONTROL_CONFIG
+            )
+        except Exception:
+            continue
+        text = (text or "").strip()
+        if text and text not in readings:
+            readings.append(text)
+    return readings
+
+
+def _digits_agree(observed, requested):
+    """True when two values carry the same digits in the same order.
+
+    The fuzzy matcher exists to absorb OCR noise, but that tolerance is fatal
+    for option names that differ by one digit: ``4000_WAVE11_PCK1`` and
+    ``4000_WAVE11_PCK01`` score above the match threshold, so a select holding
+    PCK1 was accepted as PCK01. Letters can stay fuzzy — digits cannot. Applied
+    only to de-fringed crop readings, which are clean enough to trust at this
+    resolution; the full-page pre-submit guard keeps its looser rules, where a
+    stray '0' read out of "OMI" would otherwise invent a mismatch.
+    """
+    return re.sub(r"\D", "", observed or "") == re.sub(r"\D", "", requested or "")
+
+
+def _match_control_reading(readings, requested, normalize_ocr, strict_digits=True):
+    """Classify a control's readings against the requested value.
+
+    Returns ``(status, reading)`` with status ``ok``, ``mismatch`` or
+    ``unreadable``. Any single reading that matches is accepted as proof: these
+    are renderings of the same pixels, so a recipe spelling out the requested
+    value when the control holds something else is not a realistic failure. A
+    mismatch needs the most informative reading to conflict confidently, and
+    an empty result is always ``unreadable`` — never a failure.
+
+    ``strict_digits`` is for dropdowns, where the option list makes a one-digit
+    difference a different build. Free-text values pass it False: a folder like
+    ``26.08.OMI`` reads its 'O' as '0' often enough that digit-exactness would
+    invent a mismatch on a field the user typed correctly.
+    """
+    for reading in readings:
+        if _param_values_match(reading, requested, normalize_ocr) and (
+            not strict_digits or _digits_agree(reading, requested)
+        ):
+            return "ok", reading
+    best = max(readings, key=len) if readings else ""
+    if not best:
+        return "unreadable", ""
+    if strict_digits and not _digits_agree(best, requested):
+        return "mismatch", best
+    mismatch, observed = _param_confident_mismatch(best, requested, normalize_ocr)
+    return ("mismatch" if mismatch else "unreadable"), observed or best
 
 
 def _param_verify_enabled():
@@ -523,6 +814,66 @@ def _param_crop_reread(image, label, labels, normalize_ocr, ocr_tesseract_data, 
     return _ocr_words_from_image(crop, ocr_tesseract_data, normalize_ocr, logger)
 
 
+def _param_value_box(label, words, labels, normalize_ocr):
+    """Ratio box covering the control that sits directly under a param label."""
+    try:
+        label_cy = float(label["cy"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    left = _param_label_left_ratio(label, words, labels, normalize_ocr)
+    if left is None:
+        try:
+            left = max(0.0, float(label.get("cx", 0.2)) - 0.03)
+        except (TypeError, ValueError):
+            return None
+    return (
+        max(0.0, left - 0.005),
+        max(0.0, label_cy + _PARAM_BAND_TOP),
+        min(1.0, left + 0.22),
+        min(1.0, label_cy + _PARAM_BAND_BOTTOM),
+    )
+
+
+def _read_param_control(
+    image,
+    labels,
+    requested,
+    find_any,
+    normalize_ocr,
+    ocr_tesseract_data,
+    configure_tesseract,
+    logger,
+    label=None,
+    words=None,
+    strict_digits=True,
+):
+    """Locate a parameter control and classify what it currently displays.
+
+    Returns ``(status, reading)`` from ``_match_control_reading``, or
+    ``("unreadable", "")`` when the label itself cannot be found.
+    """
+    if not words:
+        words = _ocr_words_from_image(image, ocr_tesseract_data, normalize_ocr, logger)
+    if not words:
+        return "unreadable", ""
+    if label is None:
+        try:
+            label, _which = find_any(
+                words, list(labels), min_conf=_PARAM_VERIFY_LABEL_CONF
+            )
+        except TypeError:
+            label, _which = find_any(words, list(labels))
+    if not label:
+        return "unreadable", ""
+    box = _param_value_box(label, words, labels, normalize_ocr)
+    if box is None:
+        return "unreadable", ""
+    readings = _read_control_readings(image, box, configure_tesseract, logger)
+    return _match_control_reading(
+        readings, requested, normalize_ocr, strict_digits=strict_digits
+    )
+
+
 def _param_verify_field(
     words,
     image,
@@ -534,6 +885,8 @@ def _param_verify_field(
     normalize_ocr,
     ocr_tesseract_data,
     logger,
+    configure_tesseract=None,
+    strict_digits=True,
 ):
     """Return (status, observed_display) where status is ok|mismatch|inconclusive."""
     if not requested:
@@ -579,8 +932,43 @@ def _param_verify_field(
     if mismatch2:
         return "mismatch", mismatch_obs2 or crop_observed
 
-    if had_select_failure and (observed_norm or crop_norm):
-        return "mismatch", observed_raw or crop_observed or observed_norm
+    # Full-page OCR cannot resolve the small selects at all — that is what let a
+    # run reach here with ENVIRONMENT_NAME on SIT1 and report "inconclusive,
+    # allowing submit". The de-fringed upscaled crop reads exactly these
+    # controls, so it decides before the guard gives up.
+    control_status, control_reading = "unreadable", ""
+    if callable(configure_tesseract):
+        try:
+            control_status, control_reading = _read_param_control(
+                image,
+                labels,
+                requested,
+                find_any,
+                normalize_ocr,
+                ocr_tesseract_data,
+                configure_tesseract,
+                logger,
+                label=label,
+                words=words,
+                strict_digits=strict_digits,
+            )
+        except Exception as exc:
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: pre-submit control re-read failed for %s (%s)",
+                    field_key,
+                    exc,
+                )
+    if control_status == "ok":
+        return "ok", control_reading or requested
+    if control_status == "mismatch":
+        return "mismatch", control_reading
+
+    # The fill step already retried this select twice and gave up. Reaching here
+    # means no reader could then show it holding the requested value, so there is
+    # no reading of the evidence in which submitting is safe.
+    if had_select_failure:
+        return "mismatch", observed_raw or crop_observed or control_reading or None
 
     return "inconclusive", observed_raw or crop_observed or None
 
@@ -604,8 +992,10 @@ def _verify_jenkins_params_before_submit(
     normalize_ocr,
     ocr_tesseract_data,
     logger,
+    configure_tesseract=None,
 ):
     """Raise RuntimeError when any requested parameter clearly mismatches the screen."""
+    dropdown_keys = {field_key for field_key, _labels in _JENKINS_PARAM_DROPDOWNS}
     mismatches = []
     for field_key, labels, requested in _collect_param_requests(deploy_form):
         status, observed = _param_verify_field(
@@ -619,6 +1009,8 @@ def _verify_jenkins_params_before_submit(
             normalize_ocr,
             ocr_tesseract_data,
             logger,
+            configure_tesseract=configure_tesseract,
+            strict_digits=field_key in dropdown_keys,
         )
         if status == "mismatch":
             mismatches.append((field_key, requested, observed))
@@ -844,6 +1236,7 @@ def _apply_overrides(ns):
     send_escape = ns.get("_send_escape_key")
     ocr_dump = ns.get("_jenkins_ocr_dump")
     scroll_to_top = ns.get("_jenkins_scroll_to_top")
+    scroll_down = ns.get("_jenkins_scroll_down")
 
     orig_focus = ns.get("_jenkins_focus")
 
@@ -877,6 +1270,128 @@ def _apply_overrides(ns):
         ns["_jenkins_focus"] = _jenkins_focus
         # _prepare_remote_input captured the original before this point.
         focus = _jenkins_focus
+
+    def _remeasure_after_scroll(edge_hwnd, labels, label, logger):
+        """Re-measure a revealed label once the scroll animation has stopped.
+
+        ``_jenkins_reveal_label`` scrolls the label into view and OCRs straight
+        away, but Edge animates keyboard scrolling, so the geometry it hands
+        back can be a mid-flight frame. Every click derived from it then lands
+        where the row *was*. BuildNumber was measured near cy 0.90 and clicked
+        at 0.94; by then the row had settled at 0.84 and the next parameter's
+        label occupied 0.94, so the triple-click selected that label as page
+        text and the paste went into a non-editable area.
+
+        Returns a replacement ``(label, words)`` only when the row actually
+        moved, so a page that was already still keeps the original reading.
+        """
+        if not _scroll_settle_enabled():
+            return None
+        if not (
+            callable(capture_image)
+            and callable(ocr_tesseract_data)
+            and callable(normalize_ocr)
+            and callable(find_any)
+        ):
+            return None
+        try:
+            before_cy = float(label["cy"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        image = _wait_until_settled(capture_image, _live_hwnd(edge_hwnd), logger)
+        if image is None:
+            return None
+        words = _ocr_words_from_image(
+            image, ocr_tesseract_data, normalize_ocr, logger
+        )
+        if not words:
+            return None
+        try:
+            fresh, _which = find_any(words, labels, min_conf=_PARAM_VERIFY_LABEL_CONF)
+        except TypeError:
+            fresh, _which = find_any(words, labels)
+        if not fresh:
+            return None
+        try:
+            after_cy = float(fresh["cy"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if abs(after_cy - before_cy) < _SETTLE_MIN_SHIFT:
+            return None
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: %s moved while the page was still scrolling "
+                "(cy %.3f -> %.3f) — re-measured on the settled page so the "
+                "click lands on the control, not the row below it",
+                labels[0] if labels else "label",
+                before_cy,
+                after_cy,
+            )
+        return fresh, words
+
+    # The fill routines click the label position plus 0.04 and clamp the result
+    # to 0.94, so a label revealed below this has no room for its control.
+    _LABEL_MAX_CY = 0.84
+
+    def _lift_label_into_view(edge_hwnd, labels, label, logger):
+        """Scroll on when a label was revealed against the bottom edge.
+
+        ``_jenkins_reveal_label`` stops the moment OCR can see the label, which
+        for the last parameters on the page means at the very bottom: the 10:29
+        capture has BuildNumber's label at cy 0.94 with its input box below the
+        fold. Every control sits *under* its label, so cy + 0.04 exceeded the
+        0.94 ceiling the fill routine clamps to and the click came back onto the
+        label — the capture shows "BuildNumber" selected as page text and both
+        it and FOLDER_NAME left empty after their pastes.
+
+        One more scroll step puts the label mid-viewport with its control
+        visible underneath. Returns a replacement ``(label, words)``, or None to
+        keep the original reading.
+        """
+        if not (_scroll_settle_enabled() and callable(scroll_down)):
+            return None
+        try:
+            before_cy = float(label["cy"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if before_cy <= _LABEL_MAX_CY:
+            return None
+        try:
+            scroll_down(edge_hwnd, logger, 3)
+        except TypeError:
+            scroll_down(edge_hwnd, logger)
+        time.sleep(0.4)
+
+        image = _wait_until_settled(capture_image, _live_hwnd(edge_hwnd), logger)
+        if image is None:
+            return None
+        words = _ocr_words_from_image(image, ocr_tesseract_data, normalize_ocr, logger)
+        if not words:
+            return None
+        try:
+            fresh, _which = find_any(words, labels, min_conf=_PARAM_VERIFY_LABEL_CONF)
+        except TypeError:
+            fresh, _which = find_any(words, labels)
+        if not fresh:
+            return None
+        try:
+            after_cy = float(fresh["cy"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        # Scrolling past it is worse than the bottom edge: keep the original.
+        if after_cy > _LABEL_MAX_CY or after_cy < 0.1:
+            return None
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: %s was revealed at the bottom edge (cy %.3f) with "
+                "its control below the fold — scrolled on to cy %.3f so the "
+                "click lands in the control instead of the label",
+                labels[0] if labels else "label",
+                before_cy,
+                after_cy,
+            )
+        return fresh, words
 
     if callable(orig_reveal):
 
@@ -921,7 +1436,40 @@ def _apply_overrides(ns):
                     except Exception:
                         pass
                 result = orig_reveal(edge_hwnd, labels, logger)
-            return result
+                try:
+                    label, words = result
+                except (TypeError, ValueError):
+                    return result
+                if label is None:
+                    return result
+
+            # Advisory refinement only: a capture or OCR hiccup here must never
+            # take down a run that the original reading could have completed.
+            try:
+                settled = _remeasure_after_scroll(edge_hwnd, labels, label, logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: scroll-settle re-measure failed (%s) — "
+                        "using the original reading",
+                        exc,
+                    )
+                settled = None
+            if settled is not None:
+                label, words = settled
+                result = settled
+
+            try:
+                lifted = _lift_label_into_view(edge_hwnd, labels, label, logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: bottom-edge lift failed (%s) — using the "
+                        "revealed position",
+                        exc,
+                    )
+                lifted = None
+            return lifted if lifted is not None else result
 
         ns["_jenkins_reveal_label"] = _jenkins_reveal_label
 
@@ -1563,8 +2111,10 @@ def _apply_overrides(ns):
     orig_select = ns.get("_jenkins_ocr_select_dropdown")
     normalize_ocr = ns.get("_normalize_ocr_text")
 
-    # Compiled _jenkins_ocr_select_dropdown adds this to the revealed label cy.
+    # Compiled _jenkins_ocr_select_dropdown adds these to the revealed label
+    # position before clicking.
     _COMPILED_DROPDOWN_CY_OFFSET = 0.04
+    _COMPILED_DROPDOWN_CX_OFFSET = 0.03
     # Offline-measured label-cy -> select-centre gap (1920x1116 captures, Aug 12).
     _DEFAULT_LABEL_TO_SELECT_OFFSET = 0.031
 
@@ -1728,12 +2278,232 @@ def _apply_overrides(ns):
             return None, source, offset
         return max(0.01, min(0.99, shifted)), source, offset
 
+    def _dropdown_reader_ready():
+        return (
+            callable(capture_image)
+            and callable(ocr_tesseract_data)
+            and callable(normalize_ocr)
+            and callable(find_any)
+        )
+
+    def _anchored_dropdown_point(edge_hwnd, labels, logger):
+        """Return (x_ratio, y_ratio) of the select itself, or None."""
+        reveal = ns.get("_jenkins_reveal_label")
+        if not callable(reveal):
+            return None
+        try:
+            label, words = reveal(edge_hwnd, list(labels), logger)
+        except (TypeError, ValueError):
+            return None
+        if not label:
+            return None
+        left_ratio, _source = _label_left_ratio(label, words, labels)
+        if left_ratio is None:
+            left_ratio = label.get("cx")
+        if left_ratio is None:
+            return None
+        shifted_cy, _cy_source, _cy_offset = _dropdown_shifted_cy(label, words, labels)
+        if shifted_cy is None:
+            shifted_cy = label.get("cy")
+        if shifted_cy is None:
+            return None
+        # Both anchors are pre-compensated for the offsets the compiled path
+        # adds on top of a reported label position (+0.03 x, +0.04 y). This
+        # clicks directly, so add both back to land on the control itself.
+        return (
+            max(0.01, float(left_ratio) - 0.015 + _COMPILED_DROPDOWN_CX_OFFSET),
+            min(0.99, float(shifted_cy) + _COMPILED_DROPDOWN_CY_OFFSET),
+        )
+
+    def _set_dropdown_by_typeahead(edge_hwnd, labels, requested, logger):
+        """Set a native <select> without leaving its option list on screen.
+
+        The compiled Strategy A types a filter and then clicks the option row
+        that matches — but a native <select> popup is an OS window of its own
+        and never appears in the window-owned capture, so the only matching text
+        OCR can see is the value the closed select already displays. That is why
+        both clicks in the log land on the identical point: the second one
+        reopens the box instead of choosing a row. Strategy B then steps through
+        options one at a time for ~2.5 minutes with the list held open, which is
+        also what gives the native popup time to destroy the Citrix window.
+
+        Escape closes the popup and leaves the <select> focused, and Chromium
+        type-ahead on a focused closed select jumps straight to the matching
+        option — one step, nothing left open. Returns True on a verified change,
+        or None to let the compiled routine try as before.
+
+        Enter is deliberately never sent: on a Jenkins parameter form that would
+        submit the build.
+        """
+        if not _direct_dropdown_enabled():
+            return None
+        if not (
+            _dropdown_reader_ready()
+            and callable(click_client_area)
+            and callable(send_escape)
+            and callable(type_text_unicode)
+        ):
+            return None
+
+        point = _anchored_dropdown_point(edge_hwnd, labels, logger)
+        if point is None:
+            return None
+        x_ratio, y_ratio = point
+        hwnd = _live_hwnd(edge_hwnd)
+
+        click_client_area(hwnd, logger, x_ratio=x_ratio, y_ratio=y_ratio)
+        time.sleep(0.4)
+        send_escape()
+        time.sleep(0.3)
+        if callable(release_mods):
+            release_mods()
+        type_text_unicode(requested, logger)
+        time.sleep(0.5)
+
+        status, reading = _read_dropdown(edge_hwnd, labels, requested, logger)
+        if status == "ok":
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: set %s = %s by type-ahead on the closed "
+                    "select (no option list left open, no arrow-scan)",
+                    labels[0] if labels else "dropdown",
+                    reading,
+                )
+            return True
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: type-ahead on %s left %s (requested %s) — "
+                "handing over to the compiled filter+click/arrow-scan",
+                labels[0] if labels else "dropdown",
+                reading or "an unreadable value",
+                requested,
+            )
+        return None
+
+    def _read_dropdown(edge_hwnd, labels, requested, logger, label=None):
+        """Settle the page, then classify what the select currently shows."""
+        image = _wait_until_settled(capture_image, _live_hwnd(edge_hwnd), logger)
+        if image is None:
+            return "unreadable", ""
+        return _read_param_control(
+            image,
+            labels,
+            requested,
+            find_any,
+            normalize_ocr,
+            ocr_tesseract_data,
+            configure_tesseract,
+            logger,
+            label=label,
+        )
+
+    def _dropdown_already_correct(edge_hwnd, labels, requested, logger):
+        """True when the select already holds the requested value.
+
+        Nothing on this page needed changing for ProjectName: it read ``OGW``
+        in the very first capture of every run. The compiled code could not know
+        that, because reading the value needs the de-fringed crop above, so it
+        opened the list, typed, clicked again and then spent ~2.5 minutes per
+        attempt stepping through options — twice — on a field that was already
+        right, and the native popup destroyed the Citrix window handle on the
+        way out. Checking first turns all of that into a no-op.
+        """
+        if not (_dropdown_skip_enabled() and requested and _dropdown_reader_ready()):
+            return False
+        status, reading = _read_dropdown(edge_hwnd, labels, requested, logger)
+        if status != "ok":
+            return False
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: %s already shows %s — skipping the dropdown "
+                "entirely and moving to the next parameter",
+                labels[0] if labels else "dropdown",
+                reading or requested,
+            )
+        return True
+
+    def _dropdown_readback_mismatch(edge_hwnd, label, labels, requested, logger):
+        """Re-read a select after a claimed success; True on a clear mismatch.
+
+        The compiled arrow-scan confirms its own progress with OCR taken from
+        the whole page, where a ~56x26px select is unreadable: ENVIRONMENT_NAME
+        showing SIT1 read as 'sitiv' then 'sity'. That was close enough to
+        garbage to match, so the scan logged "selected ENVIRONMENT_NAME = SIT5"
+        against a control it had never changed, and the wrong value survived all
+        the way to the submit guard. Reading the control alone tells a real
+        selection from a claimed one.
+        """
+        if not (_dropdown_readback_enabled() and requested):
+            return False
+        if not (_dropdown_reader_ready() and label):
+            return False
+        status, reading = _read_dropdown(
+            edge_hwnd, labels, requested, logger, label=label
+        )
+        if status == "ok":
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: read back %s = %s from the control itself "
+                    "(requested %s) — selection confirmed",
+                    labels[0] if labels else "dropdown",
+                    reading,
+                    requested,
+                )
+            return False
+        if status == "mismatch" and logger is not None:
+            logger.warning(
+                "Jenkins OCR: %s still shows %s after the scan reported "
+                "success (requested %s) — treating the selection as failed so "
+                "the build cannot be submitted with the wrong value",
+                labels[0] if labels else "dropdown",
+                reading,
+                requested,
+            )
+        return status == "mismatch"
+
     if callable(orig_select):
 
         def _jenkins_ocr_select_dropdown(*args, **kwargs):
             logger = _arg(args, kwargs, 4, "logger")
             if logger is not None:
                 live["logger"] = logger
+            anchor = {}
+
+            requested_value = _arg(args, kwargs, 2, "value")
+            requested_labels = _arg(args, kwargs, 1, "labels") or ()
+            try:
+                if _dropdown_already_correct(
+                    _arg(args, kwargs, 0, "edge_hwnd"),
+                    requested_labels,
+                    requested_value,
+                    logger,
+                ):
+                    return True
+            except Exception as exc:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: pre-check of %s failed (%s) — opening the "
+                        "dropdown as before",
+                        requested_labels[0] if requested_labels else "dropdown",
+                        exc,
+                    )
+
+            try:
+                if _set_dropdown_by_typeahead(
+                    _arg(args, kwargs, 0, "edge_hwnd"),
+                    requested_labels,
+                    requested_value,
+                    logger,
+                ):
+                    return True
+            except Exception as exc:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: type-ahead attempt on %s failed (%s) — "
+                        "falling back to the compiled routine",
+                        requested_labels[0] if requested_labels else "dropdown",
+                        exc,
+                    )
 
             # The dropdown code clicks at label_centre_x + 3%. Jenkins renders
             # each <select> left-aligned under its label, and a narrow one
@@ -1754,6 +2524,10 @@ def _apply_overrides(ns):
                     return result_
                 if not label:
                     return label, words
+                # Keep the label's own geometry: the shifted copy below aims at
+                # the control, but reading the value back needs the label row.
+                anchor["label"] = dict(label)
+                anchor["labels"] = labels
                 left_ratio, source = _label_left_ratio(label, words, labels)
                 if left_ratio is None:
                     if logger_ is not None:
@@ -1801,9 +2575,31 @@ def _apply_overrides(ns):
                 if callable(current_reveal):
                     ns["_jenkins_reveal_label"] = current_reveal
 
+            edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
+            field_key = _arg(args, kwargs, 3, "field_key", "dropdown")
+
+            if result:
+                # A failed read-back must not invent a failure: only a value
+                # that was read and clearly conflicts turns success into
+                # failure, and any error here leaves the result alone.
+                try:
+                    if _dropdown_readback_mismatch(
+                        edge_hwnd,
+                        anchor.get("label"),
+                        anchor.get("labels") or requested_labels,
+                        requested_value,
+                        logger,
+                    ):
+                        result = False
+                except Exception as exc:
+                    if logger is not None:
+                        logger.info(
+                            "Jenkins OCR: dropdown read-back failed (%s) — "
+                            "keeping the reported result",
+                            exc,
+                        )
+
             if not result:
-                edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
-                field_key = _arg(args, kwargs, 3, "field_key", "dropdown")
                 if field_key:
                     live["param_select_failures"].add(field_key)
                 if callable(ocr_dump):
@@ -1822,6 +2618,9 @@ def _apply_overrides(ns):
     orig_fill_params = ns.get("_fill_jenkins_ocr_parameters")
     orig_click_submit = ns.get("_jenkins_click_build_submit")
     ocr_tesseract_data = ns.get("_ocr_tesseract_data")
+    configure_tesseract = ns.get("_configure_tesseract")
+    click_client_area = ns.get("_click_client_area")
+    type_text_unicode = ns.get("_type_text_unicode")
 
     if callable(orig_fill_params):
 
@@ -1877,6 +2676,7 @@ def _apply_overrides(ns):
                             normalize_ocr,
                             ocr_tesseract_data,
                             logger,
+                            configure_tesseract=configure_tesseract,
                         )
             return orig_click_submit(*args, **kwargs)
 
