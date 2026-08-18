@@ -580,18 +580,58 @@ def _read_control_readings(image, box, configure_tesseract, logger):
     return readings
 
 
+# Glyph pairs Tesseract cannot separate on Jenkins' small controls. A select
+# holding SIT5 reads back as "SITS" and FOLDER_NAME's 26.08.OMI reads as
+# "26080MI", so comparing the raw text rejects values that are actually correct.
+# Folding each pair onto one representative fixes that without loosening
+# length: PCK1 still differs from PCK01, because that is a missing character
+# rather than a misread one.
+_OCR_CONFUSABLE_FOLD = str.maketrans(
+    {"o": "0", "i": "1", "l": "1", "|": "1", "s": "5", "z": "2", "b": "8", "g": "6"}
+)
+
+
+def _fold_ocr_confusables(text):
+    """Canonicalise glyphs OCR cannot tell apart at this resolution."""
+    return (text or "").lower().translate(_OCR_CONFUSABLE_FOLD)
+
+
+def _digits_exact(observed, requested):
+    """True when two values carry exactly the same digits in the same order."""
+    observed_digits = re.sub(r"\D", "", _fold_ocr_confusables(observed))
+    requested_digits = re.sub(r"\D", "", _fold_ocr_confusables(requested))
+    return observed_digits == requested_digits
+
+
+def _digit_groups(text):
+    """Digit runs with leading zeros stripped, so PCK01 and PCK1 line up."""
+    return [
+        group.lstrip("0") or "0"
+        for group in re.findall(r"\d+", _fold_ocr_confusables(text))
+    ]
+
+
 def _digits_agree(observed, requested):
-    """True when two values carry the same digits in the same order.
+    """True when two values carry the same digits, ignoring zero padding.
 
     The fuzzy matcher exists to absorb OCR noise, but that tolerance is fatal
-    for option names that differ by one digit: ``4000_WAVE11_PCK1`` and
-    ``4000_WAVE11_PCK01`` score above the match threshold, so a select holding
-    PCK1 was accepted as PCK01. Letters can stay fuzzy — digits cannot. Applied
-    only to de-fringed crop readings, which are clean enough to trust at this
-    resolution; the full-page pre-submit guard keeps its looser rules, where a
-    stray '0' read out of "OMI" would otherwise invent a mismatch.
+    for option names that differ by a digit: SIT1 and SIT5 score above the match
+    threshold, so a select holding SIT1 was accepted as SIT5. Letters can stay
+    fuzzy — digits cannot.
+
+    Zero padding is the one exception, because it is an OCR artefact rather than
+    a real difference: the enumerated Release_name list reads its first option as
+    ``4000_WAVE11_PCK1`` where Jenkins actually offers ``4000_WAVE11_PCK01``, the
+    zero being too narrow to survive the crop. Comparing digit runs with leading
+    zeros stripped makes those agree while keeping SIT1 (groups 51,1) apart from
+    SIT5 (groups 51,5).
+
+    Two options in the same list can differ only by padding (this list holds both
+    ``PCK2`` and ``PCK02``), so the caller that picks an option by index must
+    still require the padding-tolerant match to be unique — see
+    ``_enumerate_dropdown_options``.
     """
-    return re.sub(r"\D", "", observed or "") == re.sub(r"\D", "", requested or "")
+    return _digit_groups(observed) == _digit_groups(requested)
 
 
 def _match_control_reading(readings, requested, normalize_ocr, strict_digits=True):
@@ -752,6 +792,17 @@ def _param_values_match(observed_norm, requested_norm, normalize_ocr):
     observed = normalize_ocr(observed)
     if observed == requested:
         return True
+    folded_observed = _fold_ocr_confusables(observed)
+    folded_requested = _fold_ocr_confusables(requested)
+    if folded_observed == folded_requested:
+        return True
+    # A closed select is captured with its dropdown arrow, which OCR appends as
+    # a stray letter, so the requested value is a prefix rather than the whole
+    # reading.
+    if len(folded_requested) >= 4 and (
+        folded_requested in folded_observed or folded_observed in folded_requested
+    ):
+        return True
     if difflib.SequenceMatcher(None, observed, requested).ratio() >= _PARAM_MATCH_RATIO:
         return True
     if len(requested) >= 4 and (requested in observed or observed in requested):
@@ -900,6 +951,13 @@ def _param_verify_field(
         except TypeError:
             label, _which = find_any(words, labels)
     if not label:
+        # A parameter scrolled out of view cannot be checked, which is fine for a
+        # field nobody reported trouble with. It is not fine for a select the
+        # fill step gave up on: in the 13:04 capture Release_name had scrolled
+        # off the top, so "could not select" turned into "inconclusive, allowing
+        # submit" purely because the guard could not see it.
+        if had_select_failure:
+            return "mismatch", None
         return "inconclusive", None
 
     band = _param_band_words(words, label, labels, normalize_ocr)
@@ -909,33 +967,12 @@ def _param_verify_field(
     if _param_values_match(observed_norm, requested, normalize_ocr):
         return "ok", observed_raw or requested
 
-    mismatch, mismatch_obs = _param_confident_mismatch(
-        observed_norm, requested, normalize_ocr
-    )
-    if mismatch:
-        return "mismatch", mismatch_obs or observed_raw
-
-    crop_words = _param_crop_reread(
-        image, label, labels, normalize_ocr, ocr_tesseract_data, logger
-    )
-    crop_observed = _param_join_band(
-        sorted(crop_words, key=lambda w: (w["cy"], w["cx"]))
-    )
-    crop_norm = normalize_ocr(crop_observed) if crop_observed else ""
-
-    if _param_values_match(crop_norm, requested, normalize_ocr):
-        return "ok", crop_observed or requested
-
-    mismatch2, mismatch_obs2 = _param_confident_mismatch(
-        crop_norm, requested, normalize_ocr
-    )
-    if mismatch2:
-        return "mismatch", mismatch_obs2 or crop_observed
-
-    # Full-page OCR cannot resolve the small selects at all — that is what let a
-    # run reach here with ENVIRONMENT_NAME on SIT1 and report "inconclusive,
-    # allowing submit". The de-fringed upscaled crop reads exactly these
-    # controls, so it decides before the guard gives up.
+    # Ask the control's own pixels before trusting a full-page verdict. Page OCR
+    # renders these selects a few pixels tall and drops the character that
+    # matters: the 13:03 run read ENVIRONMENT_NAME as "sity", with the digit
+    # missing entirely, and aborted on it. The de-fringed upscaled crop reads the
+    # same control as "SITSY", which is SIT5 with a confusable 5. Leaving this
+    # after the full-page check meant it was never consulted.
     control_status, control_reading = "unreadable", ""
     if callable(configure_tesseract):
         try:
@@ -963,6 +1000,29 @@ def _param_verify_field(
         return "ok", control_reading or requested
     if control_status == "mismatch":
         return "mismatch", control_reading
+
+    mismatch, mismatch_obs = _param_confident_mismatch(
+        observed_norm, requested, normalize_ocr
+    )
+    if mismatch:
+        return "mismatch", mismatch_obs or observed_raw
+
+    crop_words = _param_crop_reread(
+        image, label, labels, normalize_ocr, ocr_tesseract_data, logger
+    )
+    crop_observed = _param_join_band(
+        sorted(crop_words, key=lambda w: (w["cy"], w["cx"]))
+    )
+    crop_norm = normalize_ocr(crop_observed) if crop_observed else ""
+
+    if _param_values_match(crop_norm, requested, normalize_ocr):
+        return "ok", crop_observed or requested
+
+    mismatch2, mismatch_obs2 = _param_confident_mismatch(
+        crop_norm, requested, normalize_ocr
+    )
+    if mismatch2:
+        return "mismatch", mismatch_obs2 or crop_observed
 
     # The fill step already retried this select twice and gave up. Reaching here
     # means no reader could then show it holding the requested value, so there is
@@ -1049,6 +1109,306 @@ def _verify_jenkins_params_before_submit(
     if logger is not None:
         logger.error(message)
     raise RuntimeError(message)
+
+
+_CITRIX_EMPTY_APPS_ERROR = "No Application visible on Icron cloud."
+
+_JENKINS_AUTOMATION_ERROR_PREFIX = (
+    "Jenkins in-page automation did not complete"
+)
+
+_jenkins_automation_abort = {"requested": False, "step": "", "message": ""}
+
+
+def _reset_jenkins_automation_abort():
+    _jenkins_automation_abort["requested"] = False
+    _jenkins_automation_abort["step"] = ""
+    _jenkins_automation_abort["message"] = ""
+
+
+def _record_jenkins_automation_failure(step=""):
+    _jenkins_automation_abort["requested"] = True
+    if step and not _jenkins_automation_abort["step"]:
+        _jenkins_automation_abort["step"] = step
+
+
+def _dropdown_missing_message(field, requested, options=None):
+    """Name the field and the value that the dropdown does not offer."""
+    message = (
+        "%s value '%s' was not found in the Jenkins dropdown — "
+        "build not submitted" % (field or "dropdown", requested)
+    )
+    available = [str(o) for o in (options or []) if str(o).strip()]
+    if available:
+        message += " (dropdown offers: %s)" % ", ".join(available)
+    return message
+
+
+def _record_dropdown_value_missing(field, requested, options=None):
+    """Record a missing dropdown value, keeping the specific wording.
+
+    A generic "did not complete" message forces the user back into the log to
+    find out which field failed, so the specific text wins over the generic
+    one built from ``step``.
+    """
+    _jenkins_automation_abort["requested"] = True
+    if field and not _jenkins_automation_abort["step"]:
+        _jenkins_automation_abort["step"] = field
+    if not _jenkins_automation_abort["message"]:
+        _jenkins_automation_abort["message"] = _dropdown_missing_message(
+            field, requested, options
+        )
+    return _jenkins_automation_abort["message"]
+
+
+def _jenkins_automation_error_message():
+    specific = (_jenkins_automation_abort.get("message") or "").strip()
+    if specific:
+        return specific
+    step = (_jenkins_automation_abort.get("step") or "").strip()
+    if step:
+        return (
+            "%s — failed to fill '%s' field — build not submitted"
+            % (_JENKINS_AUTOMATION_ERROR_PREFIX, step)
+        )
+    return "%s — build not submitted" % _JENKINS_AUTOMATION_ERROR_PREFIX
+
+
+def _raise_if_jenkins_automation_failed(logger=None):
+    if not _jenkins_automation_abort["requested"]:
+        return
+    message = _jenkins_automation_error_message()
+    if logger is not None:
+        logger.error(message)
+    raise RuntimeError(message)
+
+
+_EMPTY_APPS_MESSAGE_RE = re.compile(
+    r"there\s+are\s+no\s+apps\s+or\s+desktops\s+available",
+    re.IGNORECASE,
+)
+_ALL_ZERO_FILTER_RE = re.compile(
+    r"\bAll\s*\(\s*0\s*\)",
+    re.IGNORECASE,
+)
+# StoreFront renders sprite/template markup such as
+# class="storeapp-action-link-sprite" even when zero apps are published, so a
+# loose "storeapp" substring reports phantom tiles. Only the bare "storeapp"
+# class token marks a real app tile.
+_STOREAPP_TILE_RE = re.compile(
+    r'class\s*=\s*"[^"]*(?<![-\w])storeapp(?![-\w])',
+    re.IGNORECASE,
+)
+
+_citrix_empty_apps_abort = {"requested": False}
+_citrix_empty_apps_state = {"detected": None}
+
+
+def _empty_apps_wait_seconds():
+    try:
+        return float(os.environ.get("ENVPILOT_EMPTY_APPS_WAIT", "15"))
+    except ValueError:
+        return 15.0
+
+
+def _reset_citrix_empty_apps_abort():
+    _citrix_empty_apps_abort["requested"] = False
+    _citrix_empty_apps_state["detected"] = None
+
+
+def _driver_on_citrix_workspace(driver):
+    try:
+        url = (driver.current_url or "").lower()
+    except Exception:
+        return False
+    if "logonpoint" in url or "/logon/" in url:
+        return False
+    return "deshpdaweb" in url or "storefront" in url or (
+        "/citrix/" in url and "logon" not in url
+    )
+
+
+def _get_driver_page_source(driver):
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+    try:
+        return driver.page_source or ""
+    except Exception:
+        return ""
+
+
+def _page_source_shows_empty_apps_message(page_source):
+    if not page_source:
+        return False
+    return bool(_EMPTY_APPS_MESSAGE_RE.search(page_source))
+
+
+def _page_source_shows_zero_apps_filter(page_source):
+    if not page_source:
+        return False
+    return bool(_ALL_ZERO_FILTER_RE.search(page_source))
+
+
+def _page_source_has_app_tiles(page_source):
+    if not page_source:
+        return False
+    return bool(_STOREAPP_TILE_RE.search(page_source))
+
+
+def _count_storeapp_tiles_via_js(driver):
+    """Count real app tiles by exact class token, ignoring sprite markup."""
+    try:
+        driver.switch_to.default_content()
+        count = driver.execute_script(
+            "return Array.prototype.filter.call("
+            "document.querySelectorAll('a, div'),"
+            "function (el) { return el.classList.contains('storeapp'); }"
+            ").length;"
+        )
+        return int(count or 0)
+    except Exception:
+        return 0
+
+
+def _empty_apps_banner_visible(driver):
+    """True when StoreFront's own empty-list element is rendered on screen."""
+    try:
+        driver.switch_to.default_content()
+        return bool(
+            driver.execute_script(
+                "var el = document.querySelector("
+                "'.no-apps-or-desktops-message');"
+                "if (!el) { return false; }"
+                "if (el.offsetParent === null "
+                "&& !el.getClientRects().length) { return false; }"
+                "return /no apps or desktops available/i.test("
+                "el.textContent || '');"
+            )
+        )
+    except Exception:
+        return False
+
+
+def _zero_count_filter_visible(driver):
+    """True when the "All (n)" filter button reports zero items."""
+    try:
+        driver.switch_to.default_content()
+        return bool(
+            driver.execute_script(
+                "var els = document.querySelectorAll("
+                "'#allAppsFilterBtn, .filter-button.allApps');"
+                "for (var i = 0; i < els.length; i++) {"
+                " if (/\\(\\s*0\\s*\\)/.test(els[i].textContent || '')) {"
+                "  return true; } }"
+                "return false;"
+            )
+        )
+    except Exception:
+        return False
+
+
+def _citrix_empty_apps_page_detected(driver, logger=None):
+    """Return True when Citrix Workspace shows a stable empty Apps list."""
+    if _citrix_empty_apps_state["detected"] is not None:
+        return _citrix_empty_apps_state["detected"]
+    if driver is None or not _driver_on_citrix_workspace(driver):
+        _citrix_empty_apps_state["detected"] = False
+        return False
+
+    wait_s = _empty_apps_wait_seconds()
+    short_grace = min(3.0, wait_s)
+    poll_interval = 0.5
+    start = time.time()
+    deadline = start + wait_s
+    consecutive_empty = 0
+    saw_empty_signal = False
+
+    while time.time() < deadline:
+        src = _get_driver_page_source(driver)
+        tile_count = _count_storeapp_tiles_via_js(driver)
+        # Live DOM queries are authoritative; the page_source regexes only
+        # cover the case where scripting is unavailable.
+        has_tiles = tile_count > 0 or _page_source_has_app_tiles(src)
+        has_msg = _empty_apps_banner_visible(driver) or (
+            _page_source_shows_empty_apps_message(src)
+        )
+        has_zero = _zero_count_filter_visible(driver) or (
+            _page_source_shows_zero_apps_filter(src)
+        )
+
+        if has_tiles:
+            if logger is not None:
+                logger.info(
+                    "Citrix Workspace app list is not empty "
+                    "(%d tile(s)) - continuing normally",
+                    tile_count,
+                )
+            _citrix_empty_apps_state["detected"] = False
+            return False
+        if has_msg:
+            saw_empty_signal = True
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                _citrix_empty_apps_state["detected"] = True
+                return True
+        elif has_zero:
+            saw_empty_signal = True
+            consecutive_empty += 1
+            if consecutive_empty >= 4:
+                _citrix_empty_apps_state["detected"] = True
+                return True
+        else:
+            consecutive_empty = 0
+            if not saw_empty_signal and (time.time() - start) >= short_grace:
+                if logger is not None:
+                    logger.info(
+                        "No empty-app-list signal on the Citrix Workspace "
+                        "page within %.1fs - continuing normally",
+                        short_grace,
+                    )
+                _citrix_empty_apps_state["detected"] = False
+                return False
+
+        time.sleep(poll_interval)
+
+    src = _get_driver_page_source(driver)
+    tile_count = _count_storeapp_tiles_via_js(driver)
+    has_tiles = tile_count > 0 or _page_source_has_app_tiles(src)
+    if has_tiles:
+        _citrix_empty_apps_state["detected"] = False
+        return False
+    if saw_empty_signal and (
+        _empty_apps_banner_visible(driver)
+        or _zero_count_filter_visible(driver)
+        or _page_source_shows_empty_apps_message(src)
+        or _page_source_shows_zero_apps_filter(src)
+    ):
+        _citrix_empty_apps_state["detected"] = True
+        return True
+
+    if logger is not None:
+        logger.info(
+            "Citrix Workspace app list check inconclusive after %.1fs "
+            "(tiles=%d) - continuing normally",
+            wait_s,
+            tile_count,
+        )
+    _citrix_empty_apps_state["detected"] = False
+    return False
+
+
+def _raise_if_citrix_empty_apps_page(driver, logger):
+    if not _citrix_empty_apps_page_detected(driver, logger):
+        return
+    _citrix_empty_apps_abort["requested"] = True
+    if logger is not None:
+        logger.error(
+            "Citrix Workspace Apps list is empty — %s",
+            _CITRIX_EMPTY_APPS_ERROR,
+        )
+    raise RuntimeError(_CITRIX_EMPTY_APPS_ERROR)
 
 
 def _apply_overrides(ns):
@@ -1234,6 +1594,7 @@ def _apply_overrides(ns):
 
     orig_reveal = ns.get("_jenkins_reveal_label")
     send_escape = ns.get("_send_escape_key")
+    send_arrow = ns.get("_send_arrow_key")
     ocr_dump = ns.get("_jenkins_ocr_dump")
     scroll_to_top = ns.get("_jenkins_scroll_to_top")
     scroll_down = ns.get("_jenkins_scroll_down")
@@ -1472,6 +1833,124 @@ def _apply_overrides(ns):
             return lifted if lifted is not None else result
 
         ns["_jenkins_reveal_label"] = _jenkins_reveal_label
+
+    def _field_already_shows_value(edge_hwnd, placeholder, value, logger):
+        """True when the box already displays ``value``.
+
+        The verified fill locates its target by OCR-ing the placeholder, so a
+        successful paste hides the very anchor the check needs: the 16:13
+        capture shows "sudhansh" sitting in the box at confidence 84 while
+        "Username" is absent from the page entirely. The check then reported
+        "box click kept missing", which sent the login into re-click, scroll
+        and finally zoom-to-fit — the escalation that destroyed the Edge
+        handle. Reading the value instead settles it from the field's own
+        pixels.
+        """
+        if not value or not callable(orig_read) or not callable(find_any):
+            return False
+        # A masked field never shows its value, so a read proves nothing.
+        if "password" in str(placeholder or "").lower():
+            return False
+        try:
+            _image, words = orig_read(_live_hwnd(edge_hwnd), logger)
+        except Exception:
+            return False
+        if not words:
+            return False
+        try:
+            match, _which = find_any(words, [str(value)])
+        except Exception:
+            return False
+        if not match:
+            return False
+        if logger is not None:
+            logger.info(
+                "Jenkins login: %s already contains the requested value — "
+                "its placeholder disappears once the box is filled, so the "
+                "placeholder-based check misreported it as missing; "
+                "accepting the fill instead of escalating",
+                placeholder,
+            )
+        return True
+
+    orig_fill_verified = ns.get("_jenkins_fill_field_verified")
+
+    if callable(orig_fill_verified) and callable(ocr_dump):
+
+        def _jenkins_fill_field_verified(*args, **kwargs):
+            """Capture the page when a verified fill gives up.
+
+            'Build on' is prefilled by Jenkins with its own default, so a fill
+            that fails verification leaves the field in one of several states —
+            still the default, the pasted value OCR misread, or the two run
+            together — and the run aborts before any screenshot is taken. The
+            13:52 failure exhausted all four attempts with no capture, leaving
+            nothing to diagnose. Observation only: the result is passed straight
+            through.
+            """
+            result = orig_fill_verified(*args, **kwargs)
+            if not result:
+                placeholder = _arg(args, kwargs, 1, "placeholder")
+                logger = _arg(args, kwargs, 3, "logger")
+                if _field_already_shows_value(
+                    _arg(args, kwargs, 0, "edge_hwnd"),
+                    placeholder,
+                    _arg(args, kwargs, 2, "value"),
+                    logger,
+                ):
+                    return True
+                try:
+                    tag = "fill_fail_{}".format(
+                        re.sub(r"\W+", "_", str(placeholder or "field")).strip("_")
+                    )
+                    ocr_dump(_arg(args, kwargs, 0, "edge_hwnd"), tag, logger)
+                except Exception:
+                    pass
+                step = str(placeholder or "").strip()
+                if step:
+                    _record_jenkins_automation_failure(step)
+            return result
+
+        ns["_jenkins_fill_field_verified"] = _jenkins_fill_field_verified
+
+    orig_fill_build_on = ns.get("_jenkins_fill_build_on")
+
+    if callable(orig_fill_build_on) and callable(ocr_dump):
+
+        def _jenkins_fill_build_on(*args, **kwargs):
+            """Capture the page when the 'Build on' fill gives up.
+
+            Jenkins prefills this field with its own date, so a failed fill
+            leaves it in one of several states and the run stops with no
+            capture of what the box actually held — the 16:25 failure burned
+            four attempts and left nothing to diagnose. Observation only: the
+            result is passed straight through.
+            """
+            result = orig_fill_build_on(*args, **kwargs)
+            if not result:
+                edge_hwnd = _arg(args, kwargs, 0, "edge_hwnd")
+                logger = _arg(args, kwargs, 2, "logger")
+                try:
+                    ocr_dump(edge_hwnd, "fill_fail_Build_on", logger)
+                except Exception:
+                    pass
+                _record_jenkins_automation_failure("Build on")
+            return result
+
+        ns["_jenkins_fill_build_on"] = _jenkins_fill_build_on
+
+    orig_jenkins_after_launch = ns.get("_run_jenkins_automation_after_launch")
+    if callable(orig_jenkins_after_launch):
+
+        def _run_jenkins_automation_after_launch(*args, **kwargs):
+            ok = orig_jenkins_after_launch(*args, **kwargs)
+            if not ok:
+                _record_jenkins_automation_failure()
+            return ok
+
+        ns["_run_jenkins_automation_after_launch"] = (
+            _run_jenkins_automation_after_launch
+        )
 
     orig_read = ns.get("_jenkins_ocr_read")
 
@@ -2380,6 +2859,273 @@ def _apply_overrides(ns):
             )
         return None
 
+    # A list longer than this is not a Jenkins parameter dropdown.
+    _ENUM_MAX_OPTIONS = 60
+    _ENUM_STEP_PAUSE = 0.22
+
+    def _enumerate_enabled():
+        return os.environ.get(
+            "ENVPILOT_ENUMERATE_DROPDOWN", "1"
+        ).strip().lower() not in ("0", "false", "no")
+
+    def _capture_client_image(edge_hwnd, logger):
+        """Capture the window's pixels whichever capture binding is in force.
+
+        ``capture_image`` starts out as the compiled two-argument function but
+        is rebound partway through ``_apply_overrides`` to the shim's own
+        single-argument override, which reads its logger from ``live``. A
+        two-argument call then raises TypeError at run time — that is what
+        silenced the Release_name option-list diagnostic at 17:00:11 with
+        "takes 1 positional argument but 2 were given", leaving the question
+        of whether the requested option exists unanswered for a second run.
+        """
+        try:
+            return capture_image(edge_hwnd, logger)
+        except TypeError:
+            return capture_image(edge_hwnd)
+
+    def _control_box_now(edge_hwnd, labels, logger):
+        """Locate the select's crop box once, for repeated reads at one position.
+
+        Uses the settled capture the rest of the dropdown code reads from, so a
+        page still easing to a stop cannot lose the label.
+        """
+        image = _wait_until_settled(capture_image, _live_hwnd(edge_hwnd), logger)
+        if image is None:
+            image = _capture_client_image(_live_hwnd(edge_hwnd), logger)
+        if image is None:
+            return None, None, "no capture"
+        words = _ocr_words_from_image(
+            image, ocr_tesseract_data, normalize_ocr, logger
+        )
+        if not words:
+            return None, None, "capture produced 0 OCR tokens"
+        label = None
+        try:
+            label, _which = find_any(
+                words, list(labels), min_conf=_PARAM_VERIFY_LABEL_CONF
+            )
+        except TypeError:
+            label, _which = find_any(words, list(labels))
+        if not label:
+            return None, None, "label not found among %d tokens" % len(words)
+        box = _param_value_box(label, words, labels, normalize_ocr)
+        if box is None:
+            return None, None, "could not derive a box from the label"
+        return box, image, None
+
+    def _read_box(edge_hwnd, box, logger):
+        """Best reading of one fixed crop box, without re-locating the label."""
+        image = _capture_client_image(_live_hwnd(edge_hwnd), logger)
+        if image is None:
+            return ""
+        readings = _read_control_readings(image, box, configure_tesseract, logger)
+        return max(readings, key=len) if readings else ""
+
+    def _step_option(down):
+        send_arrow(down)
+        time.sleep(_ENUM_STEP_PAUSE)
+
+    def _enumerate_dropdown_options(edge_hwnd, labels, requested, logger):
+        """Read out a select's option list, then land on the requested value.
+
+        A native ``<select>`` popup is an OS window of its own, so it never
+        appears in the window-owned capture: OCR can only ever see the closed
+        control's current value, and nothing in the log has been able to say
+        whether a requested option exists at all. Release_name has failed
+        identically in every run — type-ahead, the compiled filter+click and two
+        full arrow-scans all left it on 4000_WAVE11_PCK1 — which is what a value
+        that is *not in the list* looks like.
+
+        Stepping the closed select with arrow keys and reading each value from
+        its own pixels enumerates the list, which both answers that question and
+        gives a selection path that does not depend on type-ahead: once the list
+        is known, the requested option is a known number of steps from the top.
+
+        Returns True when it lands on the requested value, False when the value
+        is provably absent, or None when the list could not be read.
+        """
+        name = labels[0] if labels else "dropdown"
+
+        def _give_up(reason):
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: could not read %s's option list (%s) — "
+                    "falling back to the compiled routine",
+                    name,
+                    reason,
+                )
+            return None
+
+        if not _enumerate_enabled():
+            return None
+        if not callable(send_arrow):
+            return _give_up("no arrow-key primitive")
+        if not (
+            _dropdown_reader_ready()
+            and callable(click_client_area)
+            and callable(send_escape)
+            and callable(capture_image)
+        ):
+            return _give_up("reader or input primitives unavailable")
+
+        point = _anchored_dropdown_point(edge_hwnd, labels, logger)
+        if point is None:
+            return _give_up("could not anchor a click on the select")
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: reading %s's option list from the control to find "
+                "out whether %s is even offered",
+                name,
+                requested,
+            )
+        hwnd = _live_hwnd(edge_hwnd)
+        click_client_area(hwnd, logger, x_ratio=point[0], y_ratio=point[1])
+        time.sleep(0.4)
+        send_escape()
+        time.sleep(0.3)
+        if callable(release_mods):
+            release_mods()
+
+        box, _image, why = _control_box_now(edge_hwnd, labels, logger)
+        if box is None:
+            return _give_up(why or "could not locate the control")
+        started_on = _read_box(edge_hwnd, box, logger)
+
+        # No Home key primitive exists, so walk to the top instead.
+        for _ in range(_ENUM_MAX_OPTIONS):
+            send_arrow(False)
+        time.sleep(0.4)
+
+        options = []
+        previous = None
+        unchanged = 0
+        for _ in range(_ENUM_MAX_OPTIONS):
+            reading = _read_box(edge_hwnd, box, logger)
+            if reading and reading == previous:
+                unchanged += 1
+                if unchanged >= 2:
+                    break
+            else:
+                unchanged = 0
+                if reading and reading not in options:
+                    options.append(reading)
+            previous = reading
+            _step_option(True)
+
+        if not options:
+            return _give_up(
+                "stepped the select but every read of its box was blank"
+            )
+
+        # An exact digit match is trusted straight away. Only when nothing
+        # matches exactly is zero padding treated as OCR noise, and then only if
+        # exactly one option qualifies: this list holds both PCK2 and PCK02, so
+        # an ambiguous padding match must not be resolved by guessing.
+        wanted = None
+        for index, reading in enumerate(options):
+            if _param_values_match(
+                reading, requested, normalize_ocr
+            ) and _digits_exact(reading, requested):
+                wanted = index
+                break
+
+        if wanted is None:
+            padded = [
+                index
+                for index, reading in enumerate(options)
+                if _param_values_match(reading, requested, normalize_ocr)
+                and _digits_agree(reading, requested)
+            ]
+            if len(padded) == 1:
+                wanted = padded[0]
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: %s option %d reads %s, which is %s with a "
+                        "zero too narrow to survive the crop — it is the only "
+                        "option that fits, so selecting it",
+                        name,
+                        wanted + 1,
+                        options[wanted],
+                        requested,
+                    )
+            elif len(padded) > 1:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins OCR: %s has %d options that could be %s once "
+                        "zero padding is ignored (%s) — refusing to guess",
+                        name,
+                        len(padded),
+                        requested,
+                        " | ".join(options[i] for i in padded),
+                    )
+
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: %s option list as read from the control (%d "
+                "values): %s",
+                labels[0] if labels else "dropdown",
+                len(options),
+                " | ".join(options),
+            )
+        # Kept so the abort message can name what the list actually offers.
+        live["dropdown_options"] = (name, list(options))
+
+        target = wanted if wanted is not None else None
+        if target is None:
+            # Put the select back where the page had it, so the pre-submit
+            # capture still shows what Jenkins would actually build.
+            restore = None
+            for index, reading in enumerate(options):
+                if started_on and reading == started_on:
+                    restore = index
+                    break
+            target = restore
+
+        if target is not None:
+            for _ in range(_ENUM_MAX_OPTIONS):
+                send_arrow(False)
+            time.sleep(0.3)
+            for _ in range(target):
+                _step_option(True)
+
+        if wanted is None:
+            if logger is not None:
+                logger.warning(
+                    "Jenkins OCR: %s = %s is NOT in the dropdown — the list "
+                    "holds %s. No selection method can set a value the list "
+                    "does not contain; correct the stored value. Left the "
+                    "select on %s.",
+                    labels[0] if labels else "dropdown",
+                    requested,
+                    " | ".join(options),
+                    started_on or "its original value",
+                )
+            return False
+
+        status, reading = _read_dropdown(edge_hwnd, labels, requested, logger)
+        if status == "ok":
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: set %s = %s by stepping to option %d of %d "
+                    "(no type-ahead, no filter)",
+                    labels[0] if labels else "dropdown",
+                    reading,
+                    wanted + 1,
+                    len(options),
+                )
+            return True
+        if logger is not None:
+            logger.info(
+                "Jenkins OCR: stepped %s to option %d of %d but it reads %s "
+                "— handing over to the compiled routine",
+                labels[0] if labels else "dropdown",
+                wanted + 1,
+                len(options),
+                reading or "an unreadable value",
+            )
+        return None
+
     def _read_dropdown(edge_hwnd, labels, requested, logger, label=None):
         """Settle the page, then classify what the select currently shows."""
         image = _wait_until_settled(capture_image, _live_hwnd(edge_hwnd), logger)
@@ -2463,6 +3209,29 @@ def _apply_overrides(ns):
 
     if callable(orig_select):
 
+        def _abort_dropdown_missing(field, requested, logger):
+            """Stop the run on the failing dropdown, naming the value.
+
+            Continuing past a dropdown whose value could not be set only
+            produces a wrong build (or a late, vague pre-submit abort), so the
+            failure is raised here, at the field that caused it.
+            """
+            def _key(text):
+                return "".join(
+                    ch for ch in str(text or "").lower() if ch.isalnum()
+                )
+
+            options = None
+            recorded = live.get("dropdown_options")
+            if recorded and (
+                not field or not recorded[0] or _key(recorded[0]) == _key(field)
+            ):
+                options = recorded[1]
+            message = _record_dropdown_value_missing(field, requested, options)
+            if logger is not None:
+                logger.error("Jenkins OCR: %s", message)
+            raise RuntimeError(message)
+
         def _jenkins_ocr_select_dropdown(*args, **kwargs):
             logger = _arg(args, kwargs, 4, "logger")
             if logger is not None:
@@ -2500,6 +3269,37 @@ def _apply_overrides(ns):
                 if logger is not None:
                     logger.info(
                         "Jenkins OCR: type-ahead attempt on %s failed (%s) — "
+                        "falling back to the compiled routine",
+                        requested_labels[0] if requested_labels else "dropdown",
+                        exc,
+                    )
+
+            # Type-ahead could not set it, so find out what the list actually
+            # offers rather than spending ~2.5 minutes per attempt guessing.
+            try:
+                enumerated = _enumerate_dropdown_options(
+                    _arg(args, kwargs, 0, "edge_hwnd"),
+                    requested_labels,
+                    requested_value,
+                    logger,
+                )
+                if enumerated is True:
+                    return True
+                if enumerated is False:
+                    # The value is absent from the list. Scanning cannot help,
+                    # and neither can any later step, so stop here.
+                    _abort_dropdown_missing(
+                        _arg(args, kwargs, 3, "field_key")
+                        or (requested_labels[0] if requested_labels else ""),
+                        requested_value,
+                        logger,
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: option-list read of %s failed (%s) — "
                         "falling back to the compiled routine",
                         requested_labels[0] if requested_labels else "dropdown",
                         exc,
@@ -2611,6 +3411,12 @@ def _apply_overrides(ns):
                         )
                     except Exception:
                         pass
+                _abort_dropdown_missing(
+                    field_key
+                    or (requested_labels[0] if requested_labels else ""),
+                    requested_value,
+                    logger,
+                )
             return result
 
         ns["_jenkins_ocr_select_dropdown"] = _jenkins_ocr_select_dropdown
@@ -2797,6 +3603,104 @@ def _apply_overrides(ns):
             ns["_any_tab_page_advanced_after_continue"] = (
                 _any_tab_page_advanced_after_continue
             )
+
+    orig_click_apps_tab = ns.get("_click_citrix_apps_tab")
+    if callable(orig_click_apps_tab):
+
+        def _click_citrix_apps_tab(*args, **kwargs):
+            driver = _arg(args, kwargs, 0, "driver")
+            logger = _arg(args, kwargs, 1, "logger")
+            if driver is not None and _driver_on_citrix_workspace(driver):
+                _raise_if_citrix_empty_apps_page(driver, logger)
+            return orig_click_apps_tab(*args, **kwargs)
+
+        ns["_click_citrix_apps_tab"] = _click_citrix_apps_tab
+
+    # The same empty StoreFront page also breaks the DESKTOPS tab, which
+    # otherwise fails with a misleading "Could not switch to DESKTOPS tab".
+    orig_click_desktops_tab = ns.get("_click_citrix_desktops_tab")
+    if callable(orig_click_desktops_tab):
+
+        def _click_citrix_desktops_tab(*args, **kwargs):
+            driver = _arg(args, kwargs, 0, "driver")
+            logger = _arg(args, kwargs, 1, "logger")
+            if driver is not None and _driver_on_citrix_workspace(driver):
+                _raise_if_citrix_empty_apps_page(driver, logger)
+            return orig_click_desktops_tab(*args, **kwargs)
+
+        ns["_click_citrix_desktops_tab"] = _click_citrix_desktops_tab
+
+    orig_launch_kias = ns.get("_launch_kias_desktop_from_storefront")
+    if callable(orig_launch_kias):
+
+        def _launch_kias_desktop_from_storefront(*args, **kwargs):
+            driver = _arg(args, kwargs, 0, "driver")
+            logger = _arg(args, kwargs, 1, "logger")
+            if driver is not None and _driver_on_citrix_workspace(driver):
+                _raise_if_citrix_empty_apps_page(driver, logger)
+            return orig_launch_kias(*args, **kwargs)
+
+        ns["_launch_kias_desktop_from_storefront"] = (
+            _launch_kias_desktop_from_storefront
+        )
+
+    orig_try_edge_app = ns.get("_try_edge_app_deploy")
+    if callable(orig_try_edge_app):
+
+        def _try_edge_app_deploy(*args, **kwargs):
+            driver = _arg(args, kwargs, 0, "driver")
+            logger = _arg(args, kwargs, 1, "logger")
+            result = orig_try_edge_app(*args, **kwargs)
+            if result is None and driver is not None:
+                if _driver_on_citrix_workspace(driver):
+                    _raise_if_citrix_empty_apps_page(driver, logger)
+            return result
+
+        ns["_try_edge_app_deploy"] = _try_edge_app_deploy
+
+    orig_complete_launch = ns.get("_complete_citrix_desktop_launch")
+    if callable(orig_complete_launch):
+
+        def _complete_citrix_desktop_launch(*args, **kwargs):
+            driver = _arg(args, kwargs, 0, "driver")
+            logger = _arg(args, kwargs, 2, "logger")
+            if driver is not None and _driver_on_citrix_workspace(driver):
+                _raise_if_citrix_empty_apps_page(driver, logger)
+            return orig_complete_launch(*args, **kwargs)
+
+        ns["_complete_citrix_desktop_launch"] = _complete_citrix_desktop_launch
+
+    orig_launch_ica = ns.get("_try_launch_existing_ica_session")
+    if callable(orig_launch_ica):
+
+        def _try_launch_existing_ica_session(*args, **kwargs):
+            if _citrix_empty_apps_abort["requested"]:
+                raise RuntimeError(_CITRIX_EMPTY_APPS_ERROR)
+            if _jenkins_automation_abort["requested"]:
+                _raise_if_jenkins_automation_failed(
+                    _arg(args, kwargs, 1, "logger")
+                )
+            return orig_launch_ica(*args, **kwargs)
+
+        ns["_try_launch_existing_ica_session"] = _try_launch_existing_ica_session
+
+    orig_automate_deploy = ns.get("_automate_deploy_page")
+    if callable(orig_automate_deploy):
+
+        def _automate_deploy_page(*args, **kwargs):
+            _reset_citrix_empty_apps_abort()
+            _reset_jenkins_automation_abort()
+            logger = _arg(args, kwargs, 0, "logger")
+            try:
+                result = orig_automate_deploy(*args, **kwargs)
+            except RuntimeError as exc:
+                if str(exc) == _CITRIX_EMPTY_APPS_ERROR:
+                    raise
+                raise
+            _raise_if_jenkins_automation_failed(logger)
+            return result
+
+        ns["_automate_deploy_page"] = _automate_deploy_page
 
     def _resize_jenkins_edge_window(edge_hwnd, logger):
         if sys.platform != "win32" or not edge_hwnd:
