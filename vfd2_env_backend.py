@@ -1411,6 +1411,73 @@ def _raise_if_citrix_empty_apps_page(driver, logger):
     raise RuntimeError(_CITRIX_EMPTY_APPS_ERROR)
 
 
+# Titles that belong to a shell, editor or file view rather than a logon box.
+# A published PuTTY session reached this list as
+# "/opt/SP/users/ogwvfde2/TRANSFER/tparasha/catalina.out - tparas - \\Remote".
+_SHELL_WINDOW_MARKERS = (
+    "CATALINA",
+    "BASH",
+    "SSH",
+    "SFTP",
+    "TELNET",
+    "XTERM",
+    "CONSOLE",
+    "COMMAND PROMPT",
+    "TAIL -",
+    "/VAR/",
+    "/OPT/",
+    "/USR/",
+    "/HOME/",
+    "/ETC/",
+    "/TMP/",
+)
+
+_SHELL_WINDOW_SUFFIXES = (".OUT", ".LOG", ".TXT", ".SH", ".CONF", ".XML")
+
+# A window may only receive the password if its title says it is a logon box.
+_LOGON_TITLE_MARKERS = (
+    "PASSWORD",
+    "SIGN IN",
+    "SIGN-IN",
+    "LOG ON",
+    "LOGON",
+    "AUTHENTICATION",
+    "CREDENTIAL",
+    "WINDOWS SECURITY",
+    "DESKTOP VIEWER",
+)
+
+
+def _looks_like_remote_shell_window(title):
+    """True when a title reads as a shell/file session rather than a logon box.
+
+    Seamless published apps are hosted by the Citrix client process, so the
+    process-name checks that catch a host-side PuTTY cannot see them. The
+    title is the only thing that distinguishes them.
+    """
+    text = str(title or "").strip().upper()
+    if not text:
+        return False
+    if any(marker in text for marker in _SHELL_WINDOW_MARKERS):
+        return True
+    # "name.out - user - \\Remote": test the first segment's extension.
+    head = text.split(" - ")[0].strip().rstrip("\u2014").strip()
+    return head.endswith(_SHELL_WINDOW_SUFFIXES)
+
+
+def _citrix_logon_window_is_safe(title):
+    """False when the password must not be typed into this window.
+
+    Fails closed: a shell-looking title is only accepted if it also carries a
+    logon word, so a genuine prompt that happens to mention a path still works
+    while a published terminal never receives the password.
+    """
+    if not _looks_like_remote_shell_window(title):
+        return True
+    text = str(title or "").upper()
+    return any(marker in text for marker in _LOGON_TITLE_MARKERS)
+
+
 def _apply_overrides(ns):
     """Replace Jenkins zoom helpers in the loaded backend namespace."""
     orig_zoom = ns.get("_jenkins_zoom")
@@ -3642,6 +3709,67 @@ def _apply_overrides(ns):
 
         ns["_launch_kias_desktop_from_storefront"] = (
             _launch_kias_desktop_from_storefront
+        )
+
+    # A published PuTTY session once scored highest as the "Citrix desktop
+    # password prompt" and was sent the AD password followed by Enter, because
+    # seamless apps run under the Citrix client process that the scorer trusts.
+    # The window title is the only signal that separates them, so it is checked
+    # both when the prompt is picked and again immediately before typing.
+    get_window_title = ns.get("_get_window_title")
+
+    def _window_title_for(hwnd):
+        if hwnd is None or not callable(get_window_title):
+            return ""
+        try:
+            return get_window_title(hwnd) or ""
+        except Exception:
+            return ""
+
+    orig_find_logon_window = ns.get("_find_citrix_desktop_logon_window")
+    if callable(orig_find_logon_window):
+        # The finder is polled in a wait loop, so report each window once.
+        rejected_titles = set()
+
+        def _find_citrix_desktop_logon_window(*args, **kwargs):
+            hwnd = orig_find_logon_window(*args, **kwargs)
+            if hwnd is None:
+                return hwnd
+            title = _window_title_for(hwnd)
+            if _citrix_logon_window_is_safe(title):
+                return hwnd
+            logger = _arg(args, kwargs, 0, "logger")
+            if logger is not None and title not in rejected_titles:
+                rejected_titles.add(title)
+                logger.warning(
+                    "Citrix logon: ignoring %r as the password prompt — it "
+                    "reads as a remote shell or file session, not a logon box",
+                    title,
+                )
+            return None
+
+        ns["_find_citrix_desktop_logon_window"] = _find_citrix_desktop_logon_window
+
+    orig_submit_logon = ns.get("_submit_citrix_desktop_logon_password")
+    if callable(orig_submit_logon):
+
+        def _submit_citrix_desktop_logon_password(*args, **kwargs):
+            hwnd = _arg(args, kwargs, 0, "hwnd")
+            logger = _arg(args, kwargs, 2, "logger")
+            title = _window_title_for(hwnd)
+            if not _citrix_logon_window_is_safe(title):
+                if logger is not None:
+                    logger.error(
+                        "Citrix logon: refusing to type the password into %r — "
+                        "that window is a remote shell or file session, not a "
+                        "logon prompt. Nothing was typed.",
+                        title,
+                    )
+                return False
+            return orig_submit_logon(*args, **kwargs)
+
+        ns["_submit_citrix_desktop_logon_password"] = (
+            _submit_citrix_desktop_logon_password
         )
 
     orig_try_edge_app = ns.get("_try_edge_app_deploy")
