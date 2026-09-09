@@ -7,35 +7,61 @@ alwaysApply: false
 
 ```text
 ## Context
-- Project: C:\Users\tanvip\Bat file for deployment\VFD2 Env
+- Project: C:\Users\tanvip\Bat file for deployment\EnvPilot_github\EnvPi
+- Session ID: 20260909_112843
 - Files: [list files]
-- Environment: [Windows / Citrix KIAS / Jenkins]
 
-## Current behavior
-1. ...
+## Environment (state it — this decides the outcome more often than the code)
+- Citrix desktop: already open (warm) / not open (cold CASE C sign-in)
+- Remote Edge visible and frontmost: yes / no
+- Display: 1920x1200 @ 175% scaling, 1 monitor
+- Stale tab parked on the Citrix Access Rules page: yes / no
 
-## Expected behavior
-1. ...
-
-## My observation
-- ...
+## Current vs expected behavior
+- Now: ...
+- Expected: ...
 
 ## Read first (before any change)
-- logs\vfd2_env_[latest].log
-- debug-194f10.log
+- logs\vfd2_env_<session>.log
+- logs\jenkins_ocr\*.png saved by the same run
+
+## Hypothesis to test
+Compare session <worked> with session <failed>.
+Say whether the difference is code or environment BEFORE proposing a fix.
 
 ## Constraints
-- Do not assume Citrix desktop is open
-- Do not assume Docker installed
 - Only modify: [file names]
+- Try an ENVPILOT_* env var before changing code
+- Do not assume the Citrix desktop is open
 - Do not use Win+R for Citrix Edge
 
-## Success criteria
-- [ ] ...
-- [ ] ...
+## Success criteria (log lines, not "it works")
+- [ ] log contains: Jenkins OCR: Build submitted.
+- [ ] log contains: Backend result: OK action=deploy
 
 ## Task
-[One clear action]
+[One clear action, naming the artifact]
 ```
 
-Use **Step 1: read logs and explain** then **Step 2: fix after I confirm** for risky changes.
+## Name the artifact, don't describe it
+
+| Vague | Clear |
+|---|---|
+| save this code | commit `vfd2_env_backend.py` and push |
+| commit the PR | merge PR #2 into main |
+| launch the latest bat | launch `EnvPilot.bat` |
+| check the latest log | read `logs\vfd2_env_20260909_112843.log` |
+
+## Project facts a fresh chat cannot infer
+
+- Most logic lives in `vfd2_env_backend_compiled.pyc`. `vfd2_env_backend.py` is a shim that
+  monkey-patches it through `_apply_overrides(ns)`, so functions may exist only as bytecode.
+- Each run writes its own `logs\vfd2_env_<session>.log`, and one GUI session can contain
+  several deploys with different outcomes. Always give the session ID.
+- Behaviour knobs that need no code change: `ENVPILOT_ABORT_ON_PARAM_MISMATCH`,
+  `ENVPILOT_VERIFY_DROPDOWN_READBACK`, `ENVPILOT_SKIP_CORRECT_DROPDOWN`,
+  `ENVPILOT_DIRECT_DROPDOWN`, `ENVPILOT_MAX_ZOOM_OUT`, `ENVPILOT_MAX_ZOOM_IN`,
+  `ENVPILOT_MFA_APPEAR_WAIT`, `ENVPILOT_EMPTY_APPS_WAIT`, `ENVPILOT_REMOTE_MAXIMIZE`,
+  `ENVPILOT_DPI_AWARE`, `ENVPILOT_SETTLE_SCROLL`, `ENVPILOT_NEW_WINDOW_FOCUS_ATTEMPTS`.
+
+Use **Step 1: read logs and explain**, then **Step 2: fix after I confirm** for risky changes.

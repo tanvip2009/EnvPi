@@ -1,0 +1,38 @@
+---
+description: How to launch, watch, and change EnvPilot around a live deploy run
+alwaysApply: true
+---
+
+# EnvPilot run preferences
+
+## While a run is in progress
+
+- Change nothing. Propose the change, then wait for my approval.
+- Never adjust timeouts, waits, or config without asking first.
+
+## Watchers
+
+- Tie the watcher to the app so it stops when EnvPilot closes or is force-closed.
+- Track `python.exe` whose command line contains `EnvPilot_github\EnvPi`. The
+  `powershell.exe` host launched by `EnvPilot.bat` exits early, so watching that PID
+  stops the watcher while the deploy is still running.
+- Cap the watcher at 5 minutes unless I say otherwise, and print why it stopped.
+- Filter out `tokens:` lines and `msedgedriver!` / `GetHandleVerifier` stack frames.
+
+## Reading logs
+
+- `Action failed: No active KIAS DEV & TEST DESKTOP session found` immediately after Deploy
+  is the normal `focus_desktop` probe before CASE C, not a failure. Do not report it as one.
+- A watcher started mid-run replays earlier lines. Check timestamps before treating a
+  match as new.
+
+## Before blaming the code
+
+Runs on identical code both succeed and fail depending on Citrix state — on 25 Aug, four of
+ten runs passed with no code change between them. Confirm with `git status` and
+`git diff HEAD` that code actually changed before attributing a failure to it.
+
+## Reporting a failure
+
+State the failing log line verbatim, the session ID, whether the start was warm or cold, and
+whether a build was submitted.
