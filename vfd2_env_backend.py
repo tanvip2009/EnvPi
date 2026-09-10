@@ -1500,6 +1500,142 @@ def _citrix_logon_window_is_safe(title):
     return any(marker in text for marker in _LOGON_TITLE_MARKERS)
 
 
+# Sampled from the Rebuild button fill, which is a flat (6, 63, 97).
+_SUBMIT_FILL_MIN_BLUE = 90
+_SUBMIT_FILL_MAX_RED = 120
+_SUBMIT_FILL_BLUE_OVER_RED = 40
+_SUBMIT_FILL_BLUE_OVER_GREEN = 25
+
+_SUBMIT_SEARCH_TOP_RATIO = 0.55
+_SUBMIT_CELL_PX = 8
+_SUBMIT_SCAN_STEP_PX = 2
+_SUBMIT_MIN_WIDTH_RATIO = 0.015
+_SUBMIT_MAX_WIDTH_RATIO = 0.30
+_SUBMIT_MIN_HEIGHT_RATIO = 0.010
+_SUBMIT_MAX_HEIGHT_RATIO = 0.10
+_SUBMIT_MIN_FILL_DENSITY = 0.60
+
+_PARAM_FORM_MARKERS = ("buildnummm", "parameterized")
+_SUBMIT_CONFIRM_WAIT = 3.0
+
+
+def _is_submit_button_fill(pixel):
+    """True for the flat blue of a Jenkins primary button."""
+    red, green, blue = pixel[0], pixel[1], pixel[2]
+    return (
+        blue > _SUBMIT_FILL_MIN_BLUE
+        and red < _SUBMIT_FILL_MAX_RED
+        and blue - red > _SUBMIT_FILL_BLUE_OVER_RED
+        and blue - green > _SUBMIT_FILL_BLUE_OVER_GREEN
+    )
+
+
+def _pixel_clusters(cells):
+    """Group touching cells, so each blue shape on the page is separate."""
+    clusters = []
+    seen = set()
+    for start in cells:
+        if start in seen:
+            continue
+        seen.add(start)
+        stack = [start]
+        cluster = []
+        while stack:
+            cell_x, cell_y = stack.pop()
+            cluster.append((cell_x, cell_y))
+            for step_x in (-1, 0, 1):
+                for step_y in (-1, 0, 1):
+                    neighbour = (cell_x + step_x, cell_y + step_y)
+                    if neighbour in cells and neighbour not in seen:
+                        seen.add(neighbour)
+                        stack.append(neighbour)
+        clusters.append(cluster)
+    return clusters
+
+
+def _find_submit_button_centre(image):
+    """Locate the blue submit button and return its centre as (x, y) ratios.
+
+    The styled button carries white text on a solid fill, so Tesseract returns
+    no token for it at all -- the compiled helper therefore clicks a fixed
+    0.09 of the window height below the last parameter label. The real gap is
+    about 0.143, so that click lands on the ``BuildNummm`` label and the page
+    never submits while still reporting success. The fill colour is the one
+    part of the button that is unambiguous, so match on that instead.
+
+    Returns ``None`` when nothing button-shaped is found, leaving the caller
+    to fall back rather than click a guessed position.
+    """
+    width, height = image.size
+    if not width or not height:
+        return None
+
+    top = int(height * _SUBMIT_SEARCH_TOP_RATIO)
+    crop = image.convert("RGB").crop((0, top, width, height))
+    crop_width, crop_height = crop.size
+    pixels = crop.load()
+
+    cells = set()
+    for y in range(0, crop_height, _SUBMIT_SCAN_STEP_PX):
+        for x in range(0, crop_width, _SUBMIT_SCAN_STEP_PX):
+            if _is_submit_button_fill(pixels[x, y]):
+                cells.add((x // _SUBMIT_CELL_PX, y // _SUBMIT_CELL_PX))
+    if not cells:
+        return None
+
+    candidates = []
+    for cluster in _pixel_clusters(cells):
+        xs = [cell[0] for cell in cluster]
+        ys = [cell[1] for cell in cluster]
+        left = min(xs) * _SUBMIT_CELL_PX
+        right = (max(xs) + 1) * _SUBMIT_CELL_PX
+        box_top = min(ys) * _SUBMIT_CELL_PX + top
+        box_bottom = (max(ys) + 1) * _SUBMIT_CELL_PX + top
+
+        box_width_ratio = (right - left) / float(width)
+        box_height_ratio = (box_bottom - box_top) / float(height)
+        if not (
+            _SUBMIT_MIN_WIDTH_RATIO <= box_width_ratio <= _SUBMIT_MAX_WIDTH_RATIO
+            and _SUBMIT_MIN_HEIGHT_RATIO <= box_height_ratio <= _SUBMIT_MAX_HEIGHT_RATIO
+        ):
+            continue
+
+        # A button is a solid fill; a focused input's blue border is hollow and
+        # would otherwise pass the size test on its own.
+        cells_wide = max(xs) - min(xs) + 1
+        cells_high = max(ys) - min(ys) + 1
+        if len(cluster) / float(cells_wide * cells_high) < _SUBMIT_MIN_FILL_DENSITY:
+            continue
+
+        candidates.append(
+            (
+                box_bottom,
+                (left + right) / 2.0 / float(width),
+                (box_top + box_bottom) / 2.0 / float(height),
+            )
+        )
+
+    if not candidates:
+        return None
+
+    # The submit button sits below the parameter rows, so prefer the lowest.
+    _bottom, x_ratio, y_ratio = max(candidates)
+    return x_ratio, y_ratio
+
+
+def _still_on_param_form(words):
+    """True while the parameter form is on screen, i.e. nothing was submitted.
+
+    Both the ``BuildNummm`` label and the ``/rebuild/parameterized`` address
+    disappear once Jenkins accepts the build, so either one still being
+    readable means the click missed.
+    """
+    if not words:
+        return False
+    joined = " ".join(str(word.get("norm") or "") for word in words)
+    return any(marker in joined for marker in _PARAM_FORM_MARKERS)
+
+
 def _apply_overrides(ns):
     """Replace Jenkins zoom helpers in the loaded backend namespace."""
     orig_zoom = ns.get("_jenkins_zoom")
@@ -3712,7 +3848,86 @@ def _apply_overrides(ns):
                             logger,
                             configure_tesseract=configure_tesseract,
                         )
-            return orig_click_submit(*args, **kwargs)
+            return _click_submit_and_confirm(edge_hwnd, logger, args, kwargs)
+
+        def _submit_left_the_form(edge_hwnd, logger):
+            """Re-read the page and report whether the build was really taken."""
+            time.sleep(_SUBMIT_CONFIRM_WAIT)
+            try:
+                _image, words = orig_read(_live_hwnd(edge_hwnd), logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins OCR: could not confirm the submit (%s)", exc
+                    )
+                return None
+            return not _still_on_param_form(words)
+
+        def _click_located_submit(edge_hwnd, logger):
+            """Click the blue button found by its fill. False when not found."""
+            if not callable(click_client_area):
+                return False
+            try:
+                image, _words = orig_read(_live_hwnd(edge_hwnd), logger)
+                centre = _find_submit_button_centre(image) if image else None
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins OCR: submit button search failed (%s)", exc
+                    )
+                return False
+            if centre is None:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: no blue submit button found by fill "
+                        "- falling back to the positional click"
+                    )
+                return False
+            x_ratio, y_ratio = centre
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: found 'Build' submit button by fill at "
+                    "%.0f%%,%.0f%% - clicking it",
+                    x_ratio * 100,
+                    y_ratio * 100,
+                )
+            click_client_area(
+                _live_hwnd(edge_hwnd), logger, x_ratio=x_ratio, y_ratio=y_ratio
+            )
+            return True
+
+        def _click_submit_and_confirm(edge_hwnd, logger, args, kwargs):
+            """Submit the build, then prove the form is gone before saying so.
+
+            The compiled helper returns True for any click it managed to
+            perform, so a click that misses the button is still reported as a
+            submitted build. Confirming the form has gone is what makes the
+            caller's "Build submitted." line mean something.
+            """
+            clicked = _click_located_submit(edge_hwnd, logger)
+            if clicked:
+                left_form = _submit_left_the_form(edge_hwnd, logger)
+                if left_form:
+                    return True
+                if logger is not None and left_form is False:
+                    logger.warning(
+                        "Jenkins OCR: parameter form still on screen after "
+                        "clicking the located button - retrying by position"
+                    )
+
+            positional = orig_click_submit(*args, **kwargs)
+            if not positional:
+                return False
+            left_form = _submit_left_the_form(edge_hwnd, logger)
+            if left_form is None:
+                # Confirmation itself failed; trust the click as before.
+                return True
+            if not left_form and logger is not None:
+                logger.error(
+                    "Jenkins OCR: parameter form is still on screen after the "
+                    "submit click - the build was NOT submitted"
+                )
+            return left_form
 
         ns["_jenkins_click_build_submit"] = _jenkins_click_build_submit
 
