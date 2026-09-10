@@ -3358,6 +3358,52 @@ def _apply_overrides(ns):
                 )
             return False
 
+    orig_value_on_page = ns.get("_jenkins_value_on_page")
+
+    if callable(orig_value_on_page) and callable(normalize_ocr):
+
+        def _jenkins_value_on_page(*args, **kwargs):
+            """Confirm a fill with the tolerance the submit guard already uses.
+
+            The plain check compares OCR tokens at a 0.92 fuzzy ratio with no
+            glyph folding, so a *correct* paste that reads back as ``sits``
+            (SIT5), ``26.10.0MI`` (26.10.OMI) or ``4000_WAVE11_PCKO2``
+            (…PCK02) fails it. ``_jenkins_fill_param_textfield`` then pastes a
+            second time and settles for "OCR verify inconclusive": on 10 Sep
+            14:14 three of the four fields were pasted twice for this reason.
+            The values were right — the triple-click reselects, so paste two
+            replaced paste one — but that only holds while every reselect
+            lands, and a miss would append instead of replace.
+
+            ``_param_values_match`` folds the confusable glyphs and is the
+            comparison the pre-submit guard is already trusted with. It still
+            separates SIT1 from SIT5 and PCK1 from PCK02, so this admits OCR
+            noise without admitting a wrong value. Only reached when the
+            original check has already said no, and the dropdown paths do not
+            use this helper.
+            """
+            if orig_value_on_page(*args, **kwargs):
+                return True
+            words = _arg(args, kwargs, 0, "words")
+            value = _arg(args, kwargs, 1, "value")
+            if not (words and value):
+                return False
+            for word in words:
+                if isinstance(word, dict):
+                    text = word.get("norm") or word.get("text")
+                else:
+                    text = word
+                if not text:
+                    continue
+                try:
+                    if _param_values_match(text, value, normalize_ocr):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        ns["_jenkins_value_on_page"] = _jenkins_value_on_page
+
     if callable(orig_select):
 
         def _abort_dropdown_missing(field, requested, logger):
