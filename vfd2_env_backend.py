@@ -444,6 +444,28 @@ def _dropdown_skip_enabled():
     )
 
 
+def _own_window_preferred():
+    """Whether Jenkins should get its own Edge window rather than a tab.
+
+    Same switch the new-window opener already honours, so
+    ``ENVPILOT_JENKINS_OWN_WINDOW=0`` turns off both.
+    """
+    return os.environ.get(
+        "ENVPILOT_JENKINS_OWN_WINDOW", "1"
+    ).strip().lower() not in ("0", "false", "no")
+
+
+def _rebuild_text_params_enabled():
+    """Treat Rebuild-page parameters as the text inputs they are.
+
+    Set ``ENVPILOT_REBUILD_TEXT_PARAMS=0`` to restore the dropdown mechanics
+    on that page.
+    """
+    return os.environ.get(
+        "ENVPILOT_REBUILD_TEXT_PARAMS", "1"
+    ).strip().lower() not in ("0", "false", "no")
+
+
 def _direct_dropdown_enabled():
     return os.environ.get("ENVPILOT_DIRECT_DROPDOWN", "1").strip().lower() not in (
         "0",
@@ -3274,6 +3296,68 @@ def _apply_overrides(ns):
             )
         return status == "mismatch"
 
+    def _edge_window_title(edge_hwnd):
+        get_title = ns.get("_get_window_title")
+        if not callable(get_title):
+            return ""
+        try:
+            return get_title(_live_hwnd(edge_hwnd)) or ""
+        except Exception:
+            return ""
+
+    def _on_jenkins_rebuild_page(edge_hwnd):
+        """True when the open page is the Rebuild plugin's parameter form.
+
+        "Rebuild Last" opens .../rebuild/parameterized, where every parameter
+        — including the ones the flow calls dropdowns — is a plain text input
+        pre-filled with the previous build's value. Build with Parameters
+        renders the same parameters as real <select> controls, so the page
+        decides which mechanics are correct.
+        """
+        title = _edge_window_title(edge_hwnd).upper()
+        return "REBUILD" in title and "JENKINS" in title
+
+    def _fill_param_as_text_field(edge_hwnd, labels, requested, field_key, logger):
+        """Set a Rebuild-page parameter the way its text fields are already set.
+
+        ``_jenkins_fill_param_textfield`` is the routine FOLDER_NAME and
+        BuildNumber go through: it triple-clicks the box — which selects the
+        pre-filled value so the paste replaces it — then verifies and retries.
+        Its signature matches the dropdown selector's, so the arguments pass
+        straight through.
+
+        An earlier attempt used ``_jenkins_ocr_fill``, which aims at the label
+        rather than the control: on 10 Sep 12:59 it clicked y=34.1% for
+        Release_name when the input sits at 38.3%, so the paste hit label text,
+        took no focus and was lost, leaving the old value in place.
+        """
+        filler = ns.get("_jenkins_fill_param_textfield")
+        if not callable(filler):
+            if logger is not None:
+                logger.warning(
+                    "Jenkins OCR: no text-field filler available for %s",
+                    field_key or (labels[0] if labels else "parameter"),
+                )
+            return False
+        try:
+            return bool(
+                filler(
+                    _live_hwnd(edge_hwnd),
+                    list(labels),
+                    requested,
+                    field_key,
+                    logger,
+                )
+            )
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(
+                    "Jenkins OCR: text fill of %s failed (%s)",
+                    field_key or (labels[0] if labels else "parameter"),
+                    exc,
+                )
+            return False
+
     if callable(orig_select):
 
         def _abort_dropdown_missing(field, requested, logger):
@@ -3323,6 +3407,37 @@ def _apply_overrides(ns):
                         requested_labels[0] if requested_labels else "dropdown",
                         exc,
                     )
+
+            # On the Rebuild page this parameter is a text input, so every
+            # dropdown mechanic below is wrong for it: type-ahead inserts at
+            # the caret, and the option-list read sees only the box's own text.
+            # Fill it as text and never fall through, because the fallbacks
+            # would corrupt the value they are meant to repair.
+            if _rebuild_text_params_enabled() and _on_jenkins_rebuild_page(
+                _arg(args, kwargs, 0, "edge_hwnd")
+            ):
+                field_key = _arg(args, kwargs, 3, "field_key")
+                field_name = field_key or (
+                    requested_labels[0] if requested_labels else "parameter"
+                )
+                if _fill_param_as_text_field(
+                    _arg(args, kwargs, 0, "edge_hwnd"),
+                    requested_labels,
+                    requested_value,
+                    field_key,
+                    logger,
+                ):
+                    return True
+                message = (
+                    "%s could not be set to '%s' on the Jenkins Rebuild page — "
+                    "build not submitted. The Rebuild form holds text inputs "
+                    "pre-filled from the last build, so a wrong value here "
+                    "would deploy the previous build's parameters."
+                    % (field_name, requested_value)
+                )
+                if logger is not None:
+                    logger.error("Jenkins OCR: %s", message)
+                raise RuntimeError(message)
 
             try:
                 if _set_dropdown_by_typeahead(
@@ -3785,6 +3900,93 @@ def _apply_overrides(ns):
             return result
 
         ns["_try_edge_app_deploy"] = _try_edge_app_deploy
+
+    # Launching the published 'Edge KiaSDev' app does not always give a fresh
+    # browser: Citrix reconnects the user's existing remote Edge session, tabs
+    # and all. _try_edge_app_deploy only opens a new window on the branch that
+    # already saw an Edge window open; the app-launch branch calls
+    # _navigate_citrix_edge_to_jenkins, which Ctrl+L's whatever tab is active.
+    # On 10 Sep 12:32 that turned Jenkins into tab 5 of 7 ('AskVodafone and 6
+    # more pages'), and since an Edge window's title and content follow the
+    # active tab, any later tab switch silently points OCR at the wrong page.
+    orig_open_own_window = ns.get("_open_new_citrix_edge_with_jenkins")
+    own_window_state = {"attempted": False}
+
+    if callable(orig_open_own_window):
+
+        def _open_new_citrix_edge_with_jenkins_tracked(*args, **kwargs):
+            own_window_state["attempted"] = True
+            return orig_open_own_window(*args, **kwargs)
+
+        ns["_open_new_citrix_edge_with_jenkins"] = (
+            _open_new_citrix_edge_with_jenkins_tracked
+        )
+
+    orig_navigate_edge = ns.get("_navigate_citrix_edge_to_jenkins")
+
+    if callable(orig_navigate_edge) and callable(orig_open_own_window):
+
+        def _seamless_edge_window(logger):
+            """(hwnd, title) of the remote Edge that navigation would hit."""
+            lister = ns.get("_list_citrix_session_edge_hwnds")
+            get_title = ns.get("_get_window_title")
+            if not (callable(lister) and callable(get_title)):
+                return None, ""
+            hwnds = ()
+            for call in (lambda: lister(), lambda: lister(logger)):
+                try:
+                    hwnds = call() or ()
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    return None, ""
+            best = None, ""
+            for hwnd in hwnds:
+                try:
+                    title = get_title(hwnd) or ""
+                except Exception:
+                    continue
+                if title:
+                    best = hwnd, title
+                    if " MORE PAGE" in title.upper():
+                        return hwnd, title
+            return best
+
+        def _navigate_citrix_edge_to_jenkins(*args, **kwargs):
+            logger = _arg(args, kwargs, 0, "logger")
+            if own_window_state["attempted"] or not _own_window_preferred():
+                return orig_navigate_edge(*args, **kwargs)
+
+            edge_hwnd, title = _seamless_edge_window(logger)
+            if not edge_hwnd or " MORE PAGE" not in title.upper():
+                # A single-tab window is the app's own, so navigating it in
+                # place costs nothing and keeps the existing behaviour.
+                return orig_navigate_edge(*args, **kwargs)
+
+            if logger is not None:
+                logger.info(
+                    "Jenkins: the remote Edge holds other pages (%r) — opening "
+                    "Jenkins in its own window instead of taking over a tab",
+                    title,
+                )
+            try:
+                if ns["_open_new_citrix_edge_with_jenkins"](None, edge_hwnd, logger):
+                    return True
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins: opening its own window failed (%s)", exc
+                    )
+            if logger is not None:
+                logger.warning(
+                    "Jenkins: could not give Jenkins its own window — loading "
+                    "it in the existing remote Edge instead. OCR follows the "
+                    "active tab, so do not switch tabs during this run."
+                )
+            return orig_navigate_edge(*args, **kwargs)
+
+        ns["_navigate_citrix_edge_to_jenkins"] = _navigate_citrix_edge_to_jenkins
 
     orig_complete_launch = ns.get("_complete_citrix_desktop_launch")
     if callable(orig_complete_launch):
