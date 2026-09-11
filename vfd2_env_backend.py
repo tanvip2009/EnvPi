@@ -444,6 +444,28 @@ def _dropdown_skip_enabled():
     )
 
 
+def _own_window_preferred():
+    """Whether Jenkins should get its own Edge window rather than a tab.
+
+    Same switch the new-window opener already honours, so
+    ``ENVPILOT_JENKINS_OWN_WINDOW=0`` turns off both.
+    """
+    return os.environ.get(
+        "ENVPILOT_JENKINS_OWN_WINDOW", "1"
+    ).strip().lower() not in ("0", "false", "no")
+
+
+def _rebuild_text_params_enabled():
+    """Treat Rebuild-page parameters as the text inputs they are.
+
+    Set ``ENVPILOT_REBUILD_TEXT_PARAMS=0`` to restore the dropdown mechanics
+    on that page.
+    """
+    return os.environ.get(
+        "ENVPILOT_REBUILD_TEXT_PARAMS", "1"
+    ).strip().lower() not in ("0", "false", "no")
+
+
 def _direct_dropdown_enabled():
     return os.environ.get("ENVPILOT_DIRECT_DROPDOWN", "1").strip().lower() not in (
         "0",
@@ -1409,6 +1431,209 @@ def _raise_if_citrix_empty_apps_page(driver, logger):
             _CITRIX_EMPTY_APPS_ERROR,
         )
     raise RuntimeError(_CITRIX_EMPTY_APPS_ERROR)
+
+
+# Titles that belong to a shell, editor or file view rather than a logon box.
+# A published PuTTY session reached this list as
+# "/opt/SP/users/ogwvfde2/TRANSFER/tparasha/catalina.out - tparas - \\Remote".
+_SHELL_WINDOW_MARKERS = (
+    "CATALINA",
+    "BASH",
+    "SSH",
+    "SFTP",
+    "TELNET",
+    "XTERM",
+    "CONSOLE",
+    "COMMAND PROMPT",
+    "TAIL -",
+    "/VAR/",
+    "/OPT/",
+    "/USR/",
+    "/HOME/",
+    "/ETC/",
+    "/TMP/",
+)
+
+_SHELL_WINDOW_SUFFIXES = (".OUT", ".LOG", ".TXT", ".SH", ".CONF", ".XML")
+
+# A window may only receive the password if its title says it is a logon box.
+_LOGON_TITLE_MARKERS = (
+    "PASSWORD",
+    "SIGN IN",
+    "SIGN-IN",
+    "LOG ON",
+    "LOGON",
+    "AUTHENTICATION",
+    "CREDENTIAL",
+    "WINDOWS SECURITY",
+    "DESKTOP VIEWER",
+)
+
+
+def _looks_like_remote_shell_window(title):
+    """True when a title reads as a shell/file session rather than a logon box.
+
+    Seamless published apps are hosted by the Citrix client process, so the
+    process-name checks that catch a host-side PuTTY cannot see them. The
+    title is the only thing that distinguishes them.
+    """
+    text = str(title or "").strip().upper()
+    if not text:
+        return False
+    if any(marker in text for marker in _SHELL_WINDOW_MARKERS):
+        return True
+    # "name.out - user - \\Remote": test the first segment's extension.
+    head = text.split(" - ")[0].strip().rstrip("\u2014").strip()
+    return head.endswith(_SHELL_WINDOW_SUFFIXES)
+
+
+def _citrix_logon_window_is_safe(title):
+    """False when the password must not be typed into this window.
+
+    Fails closed: a shell-looking title is only accepted if it also carries a
+    logon word, so a genuine prompt that happens to mention a path still works
+    while a published terminal never receives the password.
+    """
+    if not _looks_like_remote_shell_window(title):
+        return True
+    text = str(title or "").upper()
+    return any(marker in text for marker in _LOGON_TITLE_MARKERS)
+
+
+# Sampled from the Rebuild button fill, which is a flat (6, 63, 97).
+_SUBMIT_FILL_MIN_BLUE = 90
+_SUBMIT_FILL_MAX_RED = 120
+_SUBMIT_FILL_BLUE_OVER_RED = 40
+_SUBMIT_FILL_BLUE_OVER_GREEN = 25
+
+_SUBMIT_SEARCH_TOP_RATIO = 0.55
+_SUBMIT_CELL_PX = 8
+_SUBMIT_SCAN_STEP_PX = 2
+_SUBMIT_MIN_WIDTH_RATIO = 0.015
+_SUBMIT_MAX_WIDTH_RATIO = 0.30
+_SUBMIT_MIN_HEIGHT_RATIO = 0.010
+_SUBMIT_MAX_HEIGHT_RATIO = 0.10
+_SUBMIT_MIN_FILL_DENSITY = 0.60
+
+_PARAM_FORM_MARKERS = ("buildnummm", "parameterized")
+_SUBMIT_CONFIRM_WAIT = 3.0
+
+
+def _is_submit_button_fill(pixel):
+    """True for the flat blue of a Jenkins primary button."""
+    red, green, blue = pixel[0], pixel[1], pixel[2]
+    return (
+        blue > _SUBMIT_FILL_MIN_BLUE
+        and red < _SUBMIT_FILL_MAX_RED
+        and blue - red > _SUBMIT_FILL_BLUE_OVER_RED
+        and blue - green > _SUBMIT_FILL_BLUE_OVER_GREEN
+    )
+
+
+def _pixel_clusters(cells):
+    """Group touching cells, so each blue shape on the page is separate."""
+    clusters = []
+    seen = set()
+    for start in cells:
+        if start in seen:
+            continue
+        seen.add(start)
+        stack = [start]
+        cluster = []
+        while stack:
+            cell_x, cell_y = stack.pop()
+            cluster.append((cell_x, cell_y))
+            for step_x in (-1, 0, 1):
+                for step_y in (-1, 0, 1):
+                    neighbour = (cell_x + step_x, cell_y + step_y)
+                    if neighbour in cells and neighbour not in seen:
+                        seen.add(neighbour)
+                        stack.append(neighbour)
+        clusters.append(cluster)
+    return clusters
+
+
+def _find_submit_button_centre(image):
+    """Locate the blue submit button and return its centre as (x, y) ratios.
+
+    The styled button carries white text on a solid fill, so Tesseract returns
+    no token for it at all -- the compiled helper therefore clicks a fixed
+    0.09 of the window height below the last parameter label. The real gap is
+    about 0.143, so that click lands on the ``BuildNummm`` label and the page
+    never submits while still reporting success. The fill colour is the one
+    part of the button that is unambiguous, so match on that instead.
+
+    Returns ``None`` when nothing button-shaped is found, leaving the caller
+    to fall back rather than click a guessed position.
+    """
+    width, height = image.size
+    if not width or not height:
+        return None
+
+    top = int(height * _SUBMIT_SEARCH_TOP_RATIO)
+    crop = image.convert("RGB").crop((0, top, width, height))
+    crop_width, crop_height = crop.size
+    pixels = crop.load()
+
+    cells = set()
+    for y in range(0, crop_height, _SUBMIT_SCAN_STEP_PX):
+        for x in range(0, crop_width, _SUBMIT_SCAN_STEP_PX):
+            if _is_submit_button_fill(pixels[x, y]):
+                cells.add((x // _SUBMIT_CELL_PX, y // _SUBMIT_CELL_PX))
+    if not cells:
+        return None
+
+    candidates = []
+    for cluster in _pixel_clusters(cells):
+        xs = [cell[0] for cell in cluster]
+        ys = [cell[1] for cell in cluster]
+        left = min(xs) * _SUBMIT_CELL_PX
+        right = (max(xs) + 1) * _SUBMIT_CELL_PX
+        box_top = min(ys) * _SUBMIT_CELL_PX + top
+        box_bottom = (max(ys) + 1) * _SUBMIT_CELL_PX + top
+
+        box_width_ratio = (right - left) / float(width)
+        box_height_ratio = (box_bottom - box_top) / float(height)
+        if not (
+            _SUBMIT_MIN_WIDTH_RATIO <= box_width_ratio <= _SUBMIT_MAX_WIDTH_RATIO
+            and _SUBMIT_MIN_HEIGHT_RATIO <= box_height_ratio <= _SUBMIT_MAX_HEIGHT_RATIO
+        ):
+            continue
+
+        # A button is a solid fill; a focused input's blue border is hollow and
+        # would otherwise pass the size test on its own.
+        cells_wide = max(xs) - min(xs) + 1
+        cells_high = max(ys) - min(ys) + 1
+        if len(cluster) / float(cells_wide * cells_high) < _SUBMIT_MIN_FILL_DENSITY:
+            continue
+
+        candidates.append(
+            (
+                box_bottom,
+                (left + right) / 2.0 / float(width),
+                (box_top + box_bottom) / 2.0 / float(height),
+            )
+        )
+
+    if not candidates:
+        return None
+
+    # The submit button sits below the parameter rows, so prefer the lowest.
+    _bottom, x_ratio, y_ratio = max(candidates)
+    return x_ratio, y_ratio
+
+
+def _still_on_param_form(words):
+    """True while the parameter form is on screen, i.e. nothing was submitted.
+
+    Both the ``BuildNummm`` label and the ``/rebuild/parameterized`` address
+    disappear once Jenkins accepts the build, so either one still being
+    readable means the click missed.
+    """
+    if not words:
+        return False
+    joined = " ".join(str(word.get("norm") or "") for word in words)
+    return any(marker in joined for marker in _PARAM_FORM_MARKERS)
 
 
 def _apply_overrides(ns):
@@ -3207,6 +3432,114 @@ def _apply_overrides(ns):
             )
         return status == "mismatch"
 
+    def _edge_window_title(edge_hwnd):
+        get_title = ns.get("_get_window_title")
+        if not callable(get_title):
+            return ""
+        try:
+            return get_title(_live_hwnd(edge_hwnd)) or ""
+        except Exception:
+            return ""
+
+    def _on_jenkins_rebuild_page(edge_hwnd):
+        """True when the open page is the Rebuild plugin's parameter form.
+
+        "Rebuild Last" opens .../rebuild/parameterized, where every parameter
+        — including the ones the flow calls dropdowns — is a plain text input
+        pre-filled with the previous build's value. Build with Parameters
+        renders the same parameters as real <select> controls, so the page
+        decides which mechanics are correct.
+        """
+        title = _edge_window_title(edge_hwnd).upper()
+        return "REBUILD" in title and "JENKINS" in title
+
+    def _fill_param_as_text_field(edge_hwnd, labels, requested, field_key, logger):
+        """Set a Rebuild-page parameter the way its text fields are already set.
+
+        ``_jenkins_fill_param_textfield`` is the routine FOLDER_NAME and
+        BuildNumber go through: it triple-clicks the box — which selects the
+        pre-filled value so the paste replaces it — then verifies and retries.
+        Its signature matches the dropdown selector's, so the arguments pass
+        straight through.
+
+        An earlier attempt used ``_jenkins_ocr_fill``, which aims at the label
+        rather than the control: on 10 Sep 12:59 it clicked y=34.1% for
+        Release_name when the input sits at 38.3%, so the paste hit label text,
+        took no focus and was lost, leaving the old value in place.
+        """
+        filler = ns.get("_jenkins_fill_param_textfield")
+        if not callable(filler):
+            if logger is not None:
+                logger.warning(
+                    "Jenkins OCR: no text-field filler available for %s",
+                    field_key or (labels[0] if labels else "parameter"),
+                )
+            return False
+        try:
+            return bool(
+                filler(
+                    _live_hwnd(edge_hwnd),
+                    list(labels),
+                    requested,
+                    field_key,
+                    logger,
+                )
+            )
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(
+                    "Jenkins OCR: text fill of %s failed (%s)",
+                    field_key or (labels[0] if labels else "parameter"),
+                    exc,
+                )
+            return False
+
+    orig_value_on_page = ns.get("_jenkins_value_on_page")
+
+    if callable(orig_value_on_page) and callable(normalize_ocr):
+
+        def _jenkins_value_on_page(*args, **kwargs):
+            """Confirm a fill with the tolerance the submit guard already uses.
+
+            The plain check compares OCR tokens at a 0.92 fuzzy ratio with no
+            glyph folding, so a *correct* paste that reads back as ``sits``
+            (SIT5), ``26.10.0MI`` (26.10.OMI) or ``4000_WAVE11_PCKO2``
+            (…PCK02) fails it. ``_jenkins_fill_param_textfield`` then pastes a
+            second time and settles for "OCR verify inconclusive": on 10 Sep
+            14:14 three of the four fields were pasted twice for this reason.
+            The values were right — the triple-click reselects, so paste two
+            replaced paste one — but that only holds while every reselect
+            lands, and a miss would append instead of replace.
+
+            ``_param_values_match`` folds the confusable glyphs and is the
+            comparison the pre-submit guard is already trusted with. It still
+            separates SIT1 from SIT5 and PCK1 from PCK02, so this admits OCR
+            noise without admitting a wrong value. Only reached when the
+            original check has already said no, and the dropdown paths do not
+            use this helper.
+            """
+            if orig_value_on_page(*args, **kwargs):
+                return True
+            words = _arg(args, kwargs, 0, "words")
+            value = _arg(args, kwargs, 1, "value")
+            if not (words and value):
+                return False
+            for word in words:
+                if isinstance(word, dict):
+                    text = word.get("norm") or word.get("text")
+                else:
+                    text = word
+                if not text:
+                    continue
+                try:
+                    if _param_values_match(text, value, normalize_ocr):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        ns["_jenkins_value_on_page"] = _jenkins_value_on_page
+
     if callable(orig_select):
 
         def _abort_dropdown_missing(field, requested, logger):
@@ -3256,6 +3589,37 @@ def _apply_overrides(ns):
                         requested_labels[0] if requested_labels else "dropdown",
                         exc,
                     )
+
+            # On the Rebuild page this parameter is a text input, so every
+            # dropdown mechanic below is wrong for it: type-ahead inserts at
+            # the caret, and the option-list read sees only the box's own text.
+            # Fill it as text and never fall through, because the fallbacks
+            # would corrupt the value they are meant to repair.
+            if _rebuild_text_params_enabled() and _on_jenkins_rebuild_page(
+                _arg(args, kwargs, 0, "edge_hwnd")
+            ):
+                field_key = _arg(args, kwargs, 3, "field_key")
+                field_name = field_key or (
+                    requested_labels[0] if requested_labels else "parameter"
+                )
+                if _fill_param_as_text_field(
+                    _arg(args, kwargs, 0, "edge_hwnd"),
+                    requested_labels,
+                    requested_value,
+                    field_key,
+                    logger,
+                ):
+                    return True
+                message = (
+                    "%s could not be set to '%s' on the Jenkins Rebuild page — "
+                    "build not submitted. The Rebuild form holds text inputs "
+                    "pre-filled from the last build, so a wrong value here "
+                    "would deploy the previous build's parameters."
+                    % (field_name, requested_value)
+                )
+                if logger is not None:
+                    logger.error("Jenkins OCR: %s", message)
+                raise RuntimeError(message)
 
             try:
                 if _set_dropdown_by_typeahead(
@@ -3484,7 +3848,86 @@ def _apply_overrides(ns):
                             logger,
                             configure_tesseract=configure_tesseract,
                         )
-            return orig_click_submit(*args, **kwargs)
+            return _click_submit_and_confirm(edge_hwnd, logger, args, kwargs)
+
+        def _submit_left_the_form(edge_hwnd, logger):
+            """Re-read the page and report whether the build was really taken."""
+            time.sleep(_SUBMIT_CONFIRM_WAIT)
+            try:
+                _image, words = orig_read(_live_hwnd(edge_hwnd), logger)
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins OCR: could not confirm the submit (%s)", exc
+                    )
+                return None
+            return not _still_on_param_form(words)
+
+        def _click_located_submit(edge_hwnd, logger):
+            """Click the blue button found by its fill. False when not found."""
+            if not callable(click_client_area):
+                return False
+            try:
+                image, _words = orig_read(_live_hwnd(edge_hwnd), logger)
+                centre = _find_submit_button_centre(image) if image else None
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins OCR: submit button search failed (%s)", exc
+                    )
+                return False
+            if centre is None:
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: no blue submit button found by fill "
+                        "- falling back to the positional click"
+                    )
+                return False
+            x_ratio, y_ratio = centre
+            if logger is not None:
+                logger.info(
+                    "Jenkins OCR: found 'Build' submit button by fill at "
+                    "%.0f%%,%.0f%% - clicking it",
+                    x_ratio * 100,
+                    y_ratio * 100,
+                )
+            click_client_area(
+                _live_hwnd(edge_hwnd), logger, x_ratio=x_ratio, y_ratio=y_ratio
+            )
+            return True
+
+        def _click_submit_and_confirm(edge_hwnd, logger, args, kwargs):
+            """Submit the build, then prove the form is gone before saying so.
+
+            The compiled helper returns True for any click it managed to
+            perform, so a click that misses the button is still reported as a
+            submitted build. Confirming the form has gone is what makes the
+            caller's "Build submitted." line mean something.
+            """
+            clicked = _click_located_submit(edge_hwnd, logger)
+            if clicked:
+                left_form = _submit_left_the_form(edge_hwnd, logger)
+                if left_form:
+                    return True
+                if logger is not None and left_form is False:
+                    logger.warning(
+                        "Jenkins OCR: parameter form still on screen after "
+                        "clicking the located button - retrying by position"
+                    )
+
+            positional = orig_click_submit(*args, **kwargs)
+            if not positional:
+                return False
+            left_form = _submit_left_the_form(edge_hwnd, logger)
+            if left_form is None:
+                # Confirmation itself failed; trust the click as before.
+                return True
+            if not left_form and logger is not None:
+                logger.error(
+                    "Jenkins OCR: parameter form is still on screen after the "
+                    "submit click - the build was NOT submitted"
+                )
+            return left_form
 
         ns["_jenkins_click_build_submit"] = _jenkins_click_build_submit
 
@@ -3644,6 +4087,67 @@ def _apply_overrides(ns):
             _launch_kias_desktop_from_storefront
         )
 
+    # A published PuTTY session once scored highest as the "Citrix desktop
+    # password prompt" and was sent the AD password followed by Enter, because
+    # seamless apps run under the Citrix client process that the scorer trusts.
+    # The window title is the only signal that separates them, so it is checked
+    # both when the prompt is picked and again immediately before typing.
+    get_window_title = ns.get("_get_window_title")
+
+    def _window_title_for(hwnd):
+        if hwnd is None or not callable(get_window_title):
+            return ""
+        try:
+            return get_window_title(hwnd) or ""
+        except Exception:
+            return ""
+
+    orig_find_logon_window = ns.get("_find_citrix_desktop_logon_window")
+    if callable(orig_find_logon_window):
+        # The finder is polled in a wait loop, so report each window once.
+        rejected_titles = set()
+
+        def _find_citrix_desktop_logon_window(*args, **kwargs):
+            hwnd = orig_find_logon_window(*args, **kwargs)
+            if hwnd is None:
+                return hwnd
+            title = _window_title_for(hwnd)
+            if _citrix_logon_window_is_safe(title):
+                return hwnd
+            logger = _arg(args, kwargs, 0, "logger")
+            if logger is not None and title not in rejected_titles:
+                rejected_titles.add(title)
+                logger.warning(
+                    "Citrix logon: ignoring %r as the password prompt — it "
+                    "reads as a remote shell or file session, not a logon box",
+                    title,
+                )
+            return None
+
+        ns["_find_citrix_desktop_logon_window"] = _find_citrix_desktop_logon_window
+
+    orig_submit_logon = ns.get("_submit_citrix_desktop_logon_password")
+    if callable(orig_submit_logon):
+
+        def _submit_citrix_desktop_logon_password(*args, **kwargs):
+            hwnd = _arg(args, kwargs, 0, "hwnd")
+            logger = _arg(args, kwargs, 2, "logger")
+            title = _window_title_for(hwnd)
+            if not _citrix_logon_window_is_safe(title):
+                if logger is not None:
+                    logger.error(
+                        "Citrix logon: refusing to type the password into %r — "
+                        "that window is a remote shell or file session, not a "
+                        "logon prompt. Nothing was typed.",
+                        title,
+                    )
+                return False
+            return orig_submit_logon(*args, **kwargs)
+
+        ns["_submit_citrix_desktop_logon_password"] = (
+            _submit_citrix_desktop_logon_password
+        )
+
     orig_try_edge_app = ns.get("_try_edge_app_deploy")
     if callable(orig_try_edge_app):
 
@@ -3657,6 +4161,93 @@ def _apply_overrides(ns):
             return result
 
         ns["_try_edge_app_deploy"] = _try_edge_app_deploy
+
+    # Launching the published 'Edge KiaSDev' app does not always give a fresh
+    # browser: Citrix reconnects the user's existing remote Edge session, tabs
+    # and all. _try_edge_app_deploy only opens a new window on the branch that
+    # already saw an Edge window open; the app-launch branch calls
+    # _navigate_citrix_edge_to_jenkins, which Ctrl+L's whatever tab is active.
+    # On 10 Sep 12:32 that turned Jenkins into tab 5 of 7 ('AskVodafone and 6
+    # more pages'), and since an Edge window's title and content follow the
+    # active tab, any later tab switch silently points OCR at the wrong page.
+    orig_open_own_window = ns.get("_open_new_citrix_edge_with_jenkins")
+    own_window_state = {"attempted": False}
+
+    if callable(orig_open_own_window):
+
+        def _open_new_citrix_edge_with_jenkins_tracked(*args, **kwargs):
+            own_window_state["attempted"] = True
+            return orig_open_own_window(*args, **kwargs)
+
+        ns["_open_new_citrix_edge_with_jenkins"] = (
+            _open_new_citrix_edge_with_jenkins_tracked
+        )
+
+    orig_navigate_edge = ns.get("_navigate_citrix_edge_to_jenkins")
+
+    if callable(orig_navigate_edge) and callable(orig_open_own_window):
+
+        def _seamless_edge_window(logger):
+            """(hwnd, title) of the remote Edge that navigation would hit."""
+            lister = ns.get("_list_citrix_session_edge_hwnds")
+            get_title = ns.get("_get_window_title")
+            if not (callable(lister) and callable(get_title)):
+                return None, ""
+            hwnds = ()
+            for call in (lambda: lister(), lambda: lister(logger)):
+                try:
+                    hwnds = call() or ()
+                    break
+                except TypeError:
+                    continue
+                except Exception:
+                    return None, ""
+            best = None, ""
+            for hwnd in hwnds:
+                try:
+                    title = get_title(hwnd) or ""
+                except Exception:
+                    continue
+                if title:
+                    best = hwnd, title
+                    if " MORE PAGE" in title.upper():
+                        return hwnd, title
+            return best
+
+        def _navigate_citrix_edge_to_jenkins(*args, **kwargs):
+            logger = _arg(args, kwargs, 0, "logger")
+            if own_window_state["attempted"] or not _own_window_preferred():
+                return orig_navigate_edge(*args, **kwargs)
+
+            edge_hwnd, title = _seamless_edge_window(logger)
+            if not edge_hwnd or " MORE PAGE" not in title.upper():
+                # A single-tab window is the app's own, so navigating it in
+                # place costs nothing and keeps the existing behaviour.
+                return orig_navigate_edge(*args, **kwargs)
+
+            if logger is not None:
+                logger.info(
+                    "Jenkins: the remote Edge holds other pages (%r) — opening "
+                    "Jenkins in its own window instead of taking over a tab",
+                    title,
+                )
+            try:
+                if ns["_open_new_citrix_edge_with_jenkins"](None, edge_hwnd, logger):
+                    return True
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Jenkins: opening its own window failed (%s)", exc
+                    )
+            if logger is not None:
+                logger.warning(
+                    "Jenkins: could not give Jenkins its own window — loading "
+                    "it in the existing remote Edge instead. OCR follows the "
+                    "active tab, so do not switch tabs during this run."
+                )
+            return orig_navigate_edge(*args, **kwargs)
+
+        ns["_navigate_citrix_edge_to_jenkins"] = _navigate_citrix_edge_to_jenkins
 
     orig_complete_launch = ns.get("_complete_citrix_desktop_launch")
     if callable(orig_complete_launch):
