@@ -295,6 +295,25 @@ Overrides (see ``_apply_overrides``):
     so the compiled routine still runs, making this strictly additive. Set
     ``ENVPILOT_DIRECT_DROPDOWN=0`` to disable.
 
+20. ``_automate_citrix_to_kias_desktop``, ``_complete_citrix_desktop_launch``
+    and ``_open_putty_on_citrix_desktop`` route the SIT environment switch
+    through the published ``Putty`` app tile instead of the KIAS desktop.
+    PuTTY used to be typed into the desktop's Start menu, so a switch first had
+    to launch that desktop — but the switch reuses the deploy sign-in flow, and
+    a deploy never launches a desktop: it launches the published ``Edge
+    KiaSDev`` app, because Jenkins only needs a browser. Every switch therefore
+    opened a seamless remote Edge and then failed looking for a desktop it had
+    never asked for (``KIAS DEV & TEST DESKTOP did not open for SIT switch``,
+    14 Sep 13:32 log, after ``Edge KiaSDev app opened``). The store publishes
+    PuTTY itself — ``Putty KiaSDev 2019 PT`` and ``Putty 0_80 KiaSDev 2019 PT``
+    among its 25 app tiles — so the switch now launches that tile and drives
+    the seamless window, with no desktop involved. Sign-in is untouched: only
+    the launch step at the end of ``_run_full_deploy_flow`` is swapped, and
+    only while a switch is running, so Deploy keeps its Edge-app behaviour.
+    ``_configure_putty_session`` and ``_submit_putty_session_password`` already
+    locate their windows globally by title, so they work on a seamless window
+    unchanged. Set ``ENVPILOT_PUTTY_APP=0`` to restore the desktop route.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -4292,6 +4311,240 @@ def _apply_overrides(ns):
             return result
 
         ns["_automate_deploy_page"] = _automate_deploy_page
+
+    # A SIT switch needs a PuTTY window, not a desktop. The published PuTTY app
+    # gives one directly, so the desktop launch that never fired is skipped.
+    _putty_app_enabled = os.environ.get("ENVPILOT_PUTTY_APP", "1") != "0"
+    _putty_app_mode = {"on": False}
+    _putty_app_ctx = {"driver": None, "download_dir": None}
+    _PUTTY_CONFIG_TITLE = "PuTTY Configuration"
+    # The store publishes more than one PuTTY build; take them in this order.
+    _PUTTY_TILE_NAMES = ("putty kiasdev", "putty 0_80", "putty")
+
+    def _putty_config_hwnd():
+        finder = ns.get("_find_window_by_title_contains")
+        if not callable(finder):
+            return None
+        try:
+            return finder(_PUTTY_CONFIG_TITLE)
+        except Exception:
+            return None
+
+    def _ica_files(download_dir):
+        try:
+            names = os.listdir(download_dir)
+        except Exception:
+            return {}
+        found = {}
+        for name in names:
+            if not name.lower().endswith(".ica"):
+                continue
+            try:
+                found[name] = os.path.getmtime(os.path.join(download_dir, name))
+            except OSError:
+                continue
+        return found
+
+    def _wait_for_new_ica(download_dir, before, logger, timeout=40.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for name, mtime in _ica_files(download_dir).items():
+                if name in before and mtime <= before[name] + 0.5:
+                    continue
+                path = os.path.join(download_dir, name)
+                ready = ns.get("_wait_for_file_ready")
+                if callable(ready):
+                    try:
+                        ready(path, logger, 10)
+                    except Exception:
+                        pass
+                return path
+            time.sleep(0.5)
+        return None
+
+    _PUTTY_TILE_SCRIPT = """
+    const wanted = arguments[0];
+    const tiles = Array.from(document.querySelectorAll('a.storeapp, .storeapp'));
+    for (const want of wanted) {
+      for (const tile of tiles) {
+        const text = (tile.getAttribute('aria-label') || tile.textContent || '')
+          .toLowerCase().replace(/\\s+/g, ' ');
+        if (text.indexOf(want) !== -1) { return tile; }
+      }
+    }
+    return null;
+    """
+
+    def _find_putty_tile(driver, logger):
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            return driver.execute_script(
+                _PUTTY_TILE_SCRIPT, list(_PUTTY_TILE_NAMES)
+            )
+        except Exception as exc:
+            if logger is not None:
+                logger.warning("Could not search for a PuTTY app tile: %s", exc)
+            return None
+
+    def _launch_putty_app_tile(driver, download_dir, logger):
+        """Launch the published PuTTY app; return its Configuration hwnd."""
+        hwnd = _putty_config_hwnd()
+        if hwnd:
+            if logger is not None:
+                logger.info("PuTTY Configuration window already open - reusing it")
+            return hwnd
+
+        click_apps = ns.get("_click_citrix_apps_tab")
+        if callable(click_apps) and not click_apps(driver, logger):
+            raise RuntimeError("Could not open the APPS tab to launch PuTTY.")
+
+        tile = _find_putty_tile(driver, logger)
+        if tile is None:
+            raise RuntimeError(
+                "No published PuTTY app tile found in the Citrix APPS view."
+            )
+        if logger is not None:
+            logger.info("Found published PuTTY app tile - launching it")
+
+        before = _ica_files(download_dir)
+        double_click = ns.get("_double_click_kias_desktop")
+        if not callable(double_click):
+            raise RuntimeError("No tile click helper available for PuTTY.")
+        # The click helper reports success inconsistently across tile types, so
+        # the downloaded .ica is what actually decides whether this worked.
+        try:
+            double_click(driver, tile, logger)
+        except Exception as exc:
+            if logger is not None:
+                logger.warning("PuTTY tile click raised %s - checking for .ica", exc)
+
+        path = _wait_for_new_ica(download_dir, before, logger)
+        if not path:
+            raise RuntimeError(
+                "Citrix did not download a .ica for the PuTTY app after the "
+                "tile was clicked."
+            )
+        if logger is not None:
+            logger.info("PuTTY app .ica downloaded: %s", os.path.basename(path))
+
+        launch = ns.get("_launch_via_citrix_client")
+        if not callable(launch) or not launch(path, logger):
+            raise RuntimeError(
+                "Could not open the PuTTY .ica with the Citrix client."
+            )
+
+        waiter = ns.get("_wait_for_window_title")
+        timeout = ns.get("PUTTY_OPEN_TIMEOUT") or 60
+        hwnd = None
+        if callable(waiter):
+            hwnd = waiter(_PUTTY_CONFIG_TITLE, logger, timeout)
+        if not hwnd:
+            hwnd = _putty_config_hwnd()
+        if not hwnd:
+            raise RuntimeError(
+                "The PuTTY app launched but its Configuration window did not "
+                "appear."
+            )
+        if logger is not None:
+            logger.info("Published PuTTY app open (seamless, no KIAS desktop)")
+        return hwnd
+
+    orig_complete_launch_putty = ns.get("_complete_citrix_desktop_launch")
+    if _putty_app_enabled and callable(orig_complete_launch_putty):
+
+        def _complete_citrix_desktop_launch_putty(*args, **kwargs):
+            if not _putty_app_mode["on"]:
+                return orig_complete_launch_putty(*args, **kwargs)
+            driver = _arg(args, kwargs, 0, "driver")
+            download_dir = _arg(args, kwargs, 1, "download_dir")
+            logger = _arg(args, kwargs, 2, "logger")
+            _putty_app_ctx["driver"] = driver
+            _putty_app_ctx["download_dir"] = download_dir
+            if logger is not None:
+                logger.info(
+                    "SIT switch: launching the published PuTTY app instead of "
+                    "the KIAS desktop or Edge app"
+                )
+            _launch_putty_app_tile(driver, download_dir, logger)
+            return "PuTTY app launched for SIT switch."
+
+        ns["_complete_citrix_desktop_launch"] = _complete_citrix_desktop_launch_putty
+
+    orig_sit_to_desktop = ns.get("_automate_citrix_to_kias_desktop")
+    if _putty_app_enabled and callable(orig_sit_to_desktop):
+
+        def _automate_citrix_to_kias_desktop(logger, citrix_id, password):
+            hwnd = _putty_config_hwnd()
+            if hwnd:
+                if logger is not None:
+                    logger.info("SIT switch: reusing the PuTTY window already open")
+                return hwnd
+            if not citrix_id or not password:
+                raise ValueError(
+                    "Citrix Id and Password are required for SIT environment switch."
+                )
+            deploy_url = ns.get("DEPLOY_URL")
+            driver, download_dir, browser_mode = ns["_create_edge_driver"](logger)
+            _putty_app_ctx["driver"] = driver
+            _putty_app_ctx["download_dir"] = download_dir
+            url_loaded = False
+            if browser_mode == "new":
+                if logger is not None:
+                    logger.info("Opening Citrix URL for SIT switch: %s", deploy_url)
+                driver.get(deploy_url)
+                time.sleep(1.5)
+                url_loaded = True
+            else:
+                url_loaded = ns["_prepare_deploy_browser"](
+                    driver, browser_mode, logger
+                )
+            ns["_set_cdp_download_path"](driver, download_dir, logger)
+            _putty_app_mode["on"] = True
+            try:
+                ns["_run_full_deploy_flow"](
+                    driver,
+                    download_dir,
+                    browser_mode,
+                    citrix_id,
+                    password,
+                    logger,
+                    url_loaded=url_loaded,
+                    open_deploy=False,
+                )
+            finally:
+                _putty_app_mode["on"] = False
+            hwnd = _putty_config_hwnd()
+            if not hwnd:
+                raise RuntimeError("PuTTY did not open for the SIT switch.")
+            return hwnd
+
+        ns["_automate_citrix_to_kias_desktop"] = _automate_citrix_to_kias_desktop
+
+    orig_open_putty = ns.get("_open_putty_on_citrix_desktop")
+    if _putty_app_enabled and callable(orig_open_putty):
+
+        def _open_putty_on_citrix_desktop(*args, **kwargs):
+            logger = _arg(args, kwargs, 1, "logger")
+            hwnd = _putty_config_hwnd()
+            if hwnd:
+                if logger is not None:
+                    logger.info(
+                        "PuTTY Configuration window is already open - not "
+                        "searching a KIAS desktop Start menu"
+                    )
+                return hwnd
+            # Each host in an all-SIT run needs its own PuTTY, and the first
+            # one has since turned into a session window.
+            driver = _putty_app_ctx["driver"]
+            download_dir = _putty_app_ctx["download_dir"]
+            if driver is not None and download_dir:
+                return _launch_putty_app_tile(driver, download_dir, logger)
+            return orig_open_putty(*args, **kwargs)
+
+        ns["_open_putty_on_citrix_desktop"] = _open_putty_on_citrix_desktop
 
     def _resize_jenkins_edge_window(edge_hwnd, logger):
         if sys.platform != "win32" or not edge_hwnd:

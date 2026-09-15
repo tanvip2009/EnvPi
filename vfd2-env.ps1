@@ -1549,7 +1549,11 @@ function Show-SitEnvironmentPopup {
         $btn = New-StyledButton -Text $item.Text -X $item.X -Y $item.Y -W 110 -Primary
         $target = $item.Target
         $btn.Add_Click({
-            $script:SelectedSitTarget = $target
+            # GetNewClosure() runs this in its own dynamic module, so assigning
+            # $script:SelectedSitTarget here would set that module's copy and
+            # leave the caller's empty. Carry the choice on the form instead;
+            # mutating a shared object does cross the boundary.
+            $popup.Tag = $target
             Write-Vfd2Log "SIT environment selected: $target"
             $popup.DialogResult = [System.Windows.Forms.DialogResult]::OK
             $popup.Close()
@@ -1566,6 +1570,7 @@ function Show-SitEnvironmentPopup {
     $popup.CancelButton = $btnCancel
 
     $null = $popup.ShowDialog($script:Form)
+    $script:SelectedSitTarget = [string]$popup.Tag
     return $popup.DialogResult
 }
 
@@ -1651,6 +1656,45 @@ function Show-PuttyCredentialsPopup {
     return $popup.DialogResult
 }
 
+function Confirm-CitrixSessionForSwitch {
+    <#
+        Three-way Citrix check, mirroring Invoke-DeployCitrixFlow:
+          CASE A - KIAS desktop already open, nothing to ask for
+          CASE B - desktop locked, sign in and unlock it
+          CASE C - no desktop, sign in so sit_connect can open the Citrix URL
+        Returns $false when the user cancels the sign-in.
+    #>
+    $script:DesktopAlreadyOpen = $false
+    $script:DesktopLocked = $false
+    Invoke-WithBusy -BusyText 'Citrix CASE A: checking for open KIAS desktop...' -ActionBlock {
+        $focusResult = Invoke-Vfd2BackendSync -Action 'focus_desktop' -SkipDeploy
+        if ($focusResult.ok) {
+            $script:DesktopAlreadyOpen = $true
+            Write-Vfd2Log "Citrix CASE A: existing desktop - $($focusResult.message)"
+        } elseif ($focusResult.locked) {
+            $script:DesktopLocked = $true
+            Write-Vfd2Log 'Citrix CASE B: KIAS desktop is locked - will prompt for password'
+        } else {
+            Write-Vfd2Log 'Citrix CASE C: no KIAS desktop - Citrix sign-in required for SIT switch'
+        }
+    }
+
+    if ($script:DesktopAlreadyOpen) { return $true }
+
+    $citrixDialog = Show-CitrixSignInPopup
+    if ($citrixDialog -ne [System.Windows.Forms.DialogResult]::OK) { return $false }
+
+    if ($script:DesktopLocked) {
+        Invoke-WithBusy -BusyText 'Citrix CASE B: unlocking desktop...' -ActionBlock {
+            $unlockResult = Invoke-Vfd2BackendSync -Action 'focus_desktop' -SkipDeploy `
+                -CitrixPassword $script:CitrixPassword
+            Write-Vfd2Log "Citrix CASE B unlock: $($unlockResult.message)"
+        }
+    }
+
+    return $true
+}
+
 function Invoke-SitEnvironmentConnect {
     param([string]$SitTarget)
 
@@ -1659,30 +1703,6 @@ function Invoke-SitEnvironmentConnect {
             'Please wait for the current action to finish.',
             'Busy', 'OK', 'Warning') | Out-Null
         return
-    }
-
-    $script:DesktopAlreadyOpen = $false
-    $script:DesktopLocked = $false
-    Invoke-WithBusy -BusyText 'Checking for open KIAS desktop...' -ActionBlock {
-        $focusResult = Invoke-Vfd2BackendSync -Action 'focus_desktop' -SkipDeploy
-        if ($focusResult.ok) {
-            $script:DesktopAlreadyOpen = $true
-            Write-Vfd2Log 'KIAS desktop already open for SIT switch'
-        } elseif ($focusResult.locked) {
-            $script:DesktopLocked = $true
-        }
-    }
-
-    if (-not $script:DesktopAlreadyOpen) {
-        $citrixDialog = Show-CitrixSignInPopup
-        if ($citrixDialog -ne [System.Windows.Forms.DialogResult]::OK) { return }
-    } elseif ($script:DesktopLocked) {
-        $citrixDialog = Show-CitrixSignInPopup
-        if ($citrixDialog -ne [System.Windows.Forms.DialogResult]::OK) { return }
-        Invoke-WithBusy -BusyText 'Unlocking Citrix desktop...' -ActionBlock {
-            $null = Invoke-Vfd2BackendSync -Action 'focus_desktop' -SkipDeploy `
-                -CitrixPassword $script:CitrixPassword
-        }
     }
 
     $label = $SitTarget.ToUpper()
@@ -1702,16 +1722,34 @@ function Invoke-SitEnvironmentConnect {
 function Invoke-SubmitSwitch {
     Write-Vfd2Log 'Submit clicked (or Enter pressed)'
 
-    $deployFlow = Invoke-SharedDeployGuiFlow -ActionName 'Submit'
-    if (-not $deployFlow) { return }
-    if ($deployFlow.Mode -eq 'later') {
-        Start-DeployBatGui -Fields $deployFlow.Fields | Out-Null
+    # Switching an environment needs no build parameters, so Submit asks for the
+    # SIT target directly instead of going through the deploy form.
+    if ($script:ActiveBackendProcess -and -not $script:ActiveBackendProcess.HasExited) {
+        [System.Windows.Forms.MessageBox]::Show(
+            'Please wait for the current action to finish.',
+            'Busy', 'OK', 'Warning') | Out-Null
         return
     }
+
+    $choice = ''
+    if ($script:txtChoice) { $choice = ([string]$script:txtChoice.Text).Trim() }
+    if (-not $choice) {
+        Write-Vfd2Log 'Submit ignored - no option entered'
+        [System.Windows.Forms.MessageBox]::Show(
+            'Enter an option (1-6) before clicking Submit.',
+            'Option required', 'OK', 'Warning') | Out-Null
+        if ($script:txtChoice) { $script:txtChoice.Focus() | Out-Null }
+        return
+    }
+    Write-Vfd2Log "Submit option entered: $choice"
 
     $envDialog = Show-SitEnvironmentPopup
     if ($envDialog -ne [System.Windows.Forms.DialogResult]::OK) { return }
     if (-not $script:SelectedSitTarget) { return }
+
+    # Settle Citrix before asking for PuTTY details, so a sign-in that is going
+    # to be needed is not discovered after the credentials have been typed.
+    if (-not (Confirm-CitrixSessionForSwitch)) { return }
 
     $puttyDialog = Show-PuttyCredentialsPopup
     if ($puttyDialog -ne [System.Windows.Forms.DialogResult]::OK) { return }
