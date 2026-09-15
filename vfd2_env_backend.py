@@ -353,6 +353,16 @@ Overrides (see ``_apply_overrides``):
     its fuzzy fallback are all worth keeping, so the read and click helpers are
     wrapped for the duration of the original call rather than reimplemented.
 
+23. ``JENKINS_UPLOAD_DIR`` and ``JENKINS_UPLOAD_SCRIPT`` are repointed at the
+    upload folder that actually exists. The compiled backend builds them from
+    ``SCRIPT_DIR / ' Jenkins Deployment Script'`` -- with a leading space --
+    and the repository also carried a copy under the ordinary name. Deleting
+    the leading-space duplicate therefore broke Upload in both halves of the
+    app: the GUI's own ``Test-Path`` guard refused to open the form, and
+    ``handle_upload`` would have raised ``Jenkins upload script not found``.
+    Both names are accepted, the ordinary one first, so the folder can be named
+    sanely without stranding a checkout that still has the old one.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -1587,6 +1597,14 @@ _SUBMIT_LABEL_WORDS = ("rebuild", "build")
 # Tokens within this much of the hit's centre line count as the same row.
 _JOB_ROW_TOLERANCE = 0.01
 _JOB_CENTRE_MIN_SHIFT = 0.005
+
+# Preference order; the leading-space spelling is the one the compiled backend
+# was built against.
+_JENKINS_UPLOAD_DIR_NAMES = (
+    "Jenkins Deployment Script",
+    " Jenkins Deployment Script",
+)
+_JENKINS_UPLOAD_SCRIPT_NAME = "jenkins_deploy_utility.py"
 
 _PARAM_FORM_MARKERS = ("buildnummm", "parameterized")
 _SUBMIT_CONFIRM_WAIT = 3.0
@@ -4895,6 +4913,19 @@ def _apply_overrides(ns):
         return None
 
     ns["_resize_jenkins_edge_window"] = _resize_jenkins_edge_window
+
+    script_dir = ns.get("SCRIPT_DIR")
+    upload_dir = ns.get("JENKINS_UPLOAD_DIR")
+
+    if script_dir is not None and upload_dir is not None:
+        for folder in _JENKINS_UPLOAD_DIR_NAMES:
+            candidate = script_dir / folder
+            if not candidate.is_dir():
+                continue
+            if candidate != upload_dir:
+                ns["JENKINS_UPLOAD_DIR"] = candidate
+                ns["JENKINS_UPLOAD_SCRIPT"] = candidate / _JENKINS_UPLOAD_SCRIPT_NAME
+            break
 
 
 if not os.path.isfile(_COMPILED):

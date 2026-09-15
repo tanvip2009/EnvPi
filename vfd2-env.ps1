@@ -19,7 +19,15 @@ $script:CitrixIdFile    = Join-Path $script:Root 'citrix-id.txt'
 $script:PuttyUser       = ''
 $script:PuttyPassword   = ''
 $script:PuttyCredFile   = Join-Path $script:Root 'putty-credentials.json'
-$script:JenkinsUploadDir = Join-Path $script:Root ' Jenkins Deployment Script'
+# Accept either folder name: the backend hardcoded the leading-space spelling,
+# so removing the duplicate copy of it left Upload with nowhere to look.
+$script:JenkinsUploadDir = Join-Path $script:Root 'Jenkins Deployment Script'
+if (-not (Test-Path -LiteralPath $script:JenkinsUploadDir)) {
+    $legacyJenkinsUploadDir = Join-Path $script:Root ' Jenkins Deployment Script'
+    if (Test-Path -LiteralPath $legacyJenkinsUploadDir) {
+        $script:JenkinsUploadDir = $legacyJenkinsUploadDir
+    }
+}
 $script:JenkinsUploadCredFile = Join-Path $script:Root 'jenkins-upload-credentials.json'
 $script:SelectedSitTarget = ''
 $script:JenkinsUploadValues = @{}
