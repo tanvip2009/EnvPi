@@ -1530,12 +1530,27 @@ _SUBMIT_CELL_PX = 8
 _SUBMIT_SCAN_STEP_PX = 2
 _SUBMIT_MIN_WIDTH_RATIO = 0.015
 _SUBMIT_MAX_WIDTH_RATIO = 0.30
-_SUBMIT_MIN_HEIGHT_RATIO = 0.010
+# ClearType renders dark text with per-channel offsets, so every glyph carries
+# a blue colour fringe -- (51, 51, 108) and (178, 235, 255) both satisfy the
+# fill test above. In the 15 Sep 13:15 capture that produced six "buttons",
+# the lowest of which sat on the BuildNummm text and was duly clicked. Every
+# one of those clusters was a single text line high (<= 0.023) and <= 19 cells,
+# so requiring a genuine button's bulk rejects the fringes. A real primary
+# button is ~80x32px, i.e. ~10x4 cells at near-full density.
+_SUBMIT_MIN_HEIGHT_RATIO = 0.024
 _SUBMIT_MAX_HEIGHT_RATIO = 0.10
 _SUBMIT_MIN_FILL_DENSITY = 0.60
+_SUBMIT_MIN_CELLS = 24
 
 _PARAM_FORM_MARKERS = ("buildnummm", "parameterized")
 _SUBMIT_CONFIRM_WAIT = 3.0
+_SUBMIT_SCROLL_NOTCHES = 3
+_SUBMIT_SCROLL_MAX_STEPS = 4
+_SUBMIT_SCROLL_SETTLE = 0.6
+
+# Tokens within this much of the hit's centre line count as the same row.
+_JOB_ROW_TOLERANCE = 0.01
+_JOB_CENTRE_MIN_SHIFT = 0.005
 
 
 def _is_submit_button_fill(pixel):
@@ -1624,6 +1639,11 @@ def _find_submit_button_centre(image):
         cells_wide = max(xs) - min(xs) + 1
         cells_high = max(ys) - min(ys) + 1
         if len(cluster) / float(cells_wide * cells_high) < _SUBMIT_MIN_FILL_DENSITY:
+            continue
+
+        # Text fringes are dense and button-shaped but tiny; only real bulk
+        # separates them from a button.
+        if len(cluster) < _SUBMIT_MIN_CELLS:
             continue
 
         candidates.append(
@@ -3882,26 +3902,54 @@ def _apply_overrides(ns):
                 return None
             return not _still_on_param_form(words)
 
-        def _click_located_submit(edge_hwnd, logger):
-            """Click the blue button found by its fill. False when not found."""
-            if not callable(click_client_area):
-                return False
+        def _locate_submit_by_fill(edge_hwnd, logger):
+            """Capture the page and return the button centre, or None."""
             try:
                 image, _words = orig_read(_live_hwnd(edge_hwnd), logger)
-                centre = _find_submit_button_centre(image) if image else None
             except Exception as exc:
                 if logger is not None:
                     logger.warning(
                         "Jenkins OCR: submit button search failed (%s)", exc
                     )
+                return None
+            return _find_submit_button_centre(image) if image else None
+
+        def _click_located_submit(edge_hwnd, logger):
+            """Click the blue button found by its fill. False when not found.
+
+            The button sits below the last parameter, so a form with several
+            parameters pushes it off the bottom of the window: the 15 Sep 13:15
+            capture ends at an empty ``BuildNummm`` field with no button in
+            frame at all. Scroll a few notches at a time and look again rather
+            than assuming it is already visible.
+            """
+            if not callable(click_client_area):
                 return False
+            centre = _locate_submit_by_fill(edge_hwnd, logger)
+            scrolls = 0
+            while (
+                centre is None
+                and callable(scroll_down)
+                and scrolls < _SUBMIT_SCROLL_MAX_STEPS
+            ):
+                scroll_down(_live_hwnd(edge_hwnd), logger, _SUBMIT_SCROLL_NOTCHES)
+                scrolls += 1
+                time.sleep(_SUBMIT_SCROLL_SETTLE)
+                centre = _locate_submit_by_fill(edge_hwnd, logger)
             if centre is None:
                 if logger is not None:
                     logger.info(
-                        "Jenkins OCR: no blue submit button found by fill "
-                        "- falling back to the positional click"
+                        "Jenkins OCR: no blue submit button found by fill after "
+                        "%d scroll step(s) - falling back to the positional click",
+                        scrolls,
                     )
                 return False
+            if scrolls and logger is not None:
+                logger.info(
+                    "Jenkins OCR: scrolled %d step(s) to bring the 'Build' "
+                    "button into view",
+                    scrolls,
+                )
             x_ratio, y_ratio = centre
             if logger is not None:
                 logger.info(
@@ -3949,6 +3997,101 @@ def _apply_overrides(ns):
             return left_form
 
         ns["_jenkins_click_build_submit"] = _jenkins_click_build_submit
+
+    orig_job_click = ns.get("_jenkins_click_exact_job")
+
+    if (
+        callable(orig_job_click)
+        and callable(orig_read)
+        and callable(click_client_area)
+        and callable(normalize_ocr)
+    ):
+
+        def _job_run_centre_x(words, target_norm, cy, fallback):
+            """Horizontal centre of the whole job-name run on ``cy``'s row."""
+            lefts = []
+            rights = []
+            for word in words or ():
+                word_cy = word.get("cy")
+                norm = word.get("norm")
+                cx = word.get("cx")
+                x1 = word.get("x1")
+                if word_cy is None or cx is None or x1 is None or not norm:
+                    continue
+                if abs(word_cy - cy) > _JOB_ROW_TOLERANCE:
+                    continue
+                if norm not in target_norm:
+                    continue
+                if x1 <= cx:
+                    # x1 is not the right edge after all; do not guess.
+                    return fallback
+                lefts.append(2.0 * cx - x1)
+                rights.append(x1)
+            if not lefts:
+                return fallback
+            return (min(lefts) + max(rights)) / 2.0
+
+        def _jenkins_click_exact_job(*args, **kwargs):
+            """Click the middle of the job link, not the mean of its tokens.
+
+            ``_jenkins_find_token_run`` returns the average of the centres of
+            the tokens it picked, so a name that OCR splits into pieces yields
+            a point near the start of the link -- 29% for
+            deploy_from_nexus_maven_2, a couple of pixels inside the text. On
+            15 Sep 14:22 that landed in the health-icon column instead: Jenkins
+            opened the "Build stability" tooltip, the page never left the
+            dashboard, and the following 'Rebuild Last' lookup failed. The
+            same 29% navigated fine at 13:14, so the point is simply too close
+            to the edge to survive a small layout shift.
+
+            The finding logic, its retries and its fuzzy fallback are all worth
+            keeping, so the read and click helpers are wrapped for the duration
+            of the original call rather than reimplemented here.
+            """
+            target = _arg(args, kwargs, 1, "target")
+            logger = _arg(args, kwargs, 2, "logger")
+            target_norm = normalize_ocr(target) or ""
+            saved_read = ns.get("_jenkins_ocr_read")
+            saved_click = ns.get("_click_client_area")
+            if not (callable(saved_read) and callable(saved_click)):
+                return orig_job_click(*args, **kwargs)
+            seen = {"words": None}
+
+            def _read_and_remember(*read_args, **read_kwargs):
+                image, words = saved_read(*read_args, **read_kwargs)
+                seen["words"] = words
+                return image, words
+
+            def _click_run_centre(hwnd, click_logger, x_ratio=None,
+                                  y_ratio=None, **rest):
+                if x_ratio is not None and y_ratio is not None and target_norm:
+                    widened = _job_run_centre_x(
+                        seen.get("words"), target_norm, y_ratio, x_ratio
+                    )
+                    if abs(widened - x_ratio) > _JOB_CENTRE_MIN_SHIFT:
+                        if click_logger is not None:
+                            click_logger.info(
+                                "Jenkins OCR: clicking the centre of the '%s' "
+                                "link at %.0f%% rather than its leading edge "
+                                "at %.0f%%",
+                                target,
+                                widened * 100,
+                                x_ratio * 100,
+                            )
+                        x_ratio = widened
+                return saved_click(
+                    hwnd, click_logger, x_ratio=x_ratio, y_ratio=y_ratio, **rest
+                )
+
+            ns["_jenkins_ocr_read"] = _read_and_remember
+            ns["_click_client_area"] = _click_run_centre
+            try:
+                return orig_job_click(*args, **kwargs)
+            finally:
+                ns["_jenkins_ocr_read"] = saved_read
+                ns["_click_client_area"] = saved_click
+
+        ns["_jenkins_click_exact_job"] = _jenkins_click_exact_job
 
     orig_mfa_wait = ns.get("_wait_for_mfa_verification")
     mfa_page_visible = ns.get("_mfa_approval_page_visible")
