@@ -314,6 +314,30 @@ Overrides (see ``_apply_overrides``):
     locate their windows globally by title, so they work on a seamless window
     unchanged. Set ``ENVPILOT_PUTTY_APP=0`` to restore the desktop route.
 
+21. ``_find_submit_button_centre`` rejects text, and ``_click_located_submit``
+    scrolls the button into view before clicking. Two 15 Sep runs (11:57:52 and
+    12:04:36) filled and verified every parameter, then logged
+    ``found 'Build' submit button by fill at 24%,91% - clicking it`` followed by
+    ``parameter form is still on screen after the submit click - the build was
+    NOT submitted``. Re-scanning ``jenkins_before_build_120213.png`` shows why:
+    on the ``/rebuild/parameterized`` page the form ends with ``BuildNummm`` at
+    the bottom edge of the 1920x1032 window, so the button is below the fold and
+    every one of the ten shapes the scan matched was navy *text*. The
+    cell-density test cannot tell them apart -- a word fills its own bounding
+    box as densely as a button -- but the pixels inside the box can:
+    ``_interior_fill_fraction`` measures 0.89 for the real button against 0.14
+    for the ``BuildNummm`` label and 0.05-0.15 for every heading, so a 0.50
+    threshold drops all of them. That alone would only turn a wrong click into
+    no click, so the finder now scrolls down up to
+    ``ENVPILOT_SUBMIT_SCROLL_ATTEMPTS`` times (default 4) and rescans, widening
+    the search band to the top 20% of the viewport because a scrolled-in button
+    can land anywhere in it. ``_find_submit_label_centre`` adds a token match on
+    ``Rebuild``/``Build`` for the rare capture where Tesseract reads the
+    white-on-navy label, restricted to below cy 0.40 so the ``Rebuild``
+    breadcrumb cannot be clicked -- that would reload the form and discard every
+    filled parameter. Scrolling happens after the override 14 parameter guard
+    has read the page, so verification still sees the filled fields.
+
 Host-side ``SetWindowPos`` cannot fix the height: it moves the seamless proxy
 window only, so the resize logs ``actual 1920x1032`` while the capture the OCR
 pipeline receives stays 1920x569. Only the remote window manager can resize the
@@ -1533,6 +1557,17 @@ _SUBMIT_MAX_WIDTH_RATIO = 0.30
 _SUBMIT_MIN_HEIGHT_RATIO = 0.010
 _SUBMIT_MAX_HEIGHT_RATIO = 0.10
 _SUBMIT_MIN_FILL_DENSITY = 0.60
+# A solid button reads ~0.89 of its own box; the navy ``BuildNummm`` label
+# reads 0.14 and the page headings 0.05-0.15 (measured 15 Sep).
+_SUBMIT_MIN_INTERIOR_FILL = 0.50
+# Retry passes search higher up the page: once the button must be scrolled
+# into view there is no telling where in the viewport it lands.
+_SUBMIT_RESCAN_TOP_RATIO = 0.20
+_SUBMIT_SCROLL_NOTCHES = 4
+# The ``Rebuild`` breadcrumb sits at the top of the page, so label matches
+# are only trusted below this point.
+_SUBMIT_LABEL_MIN_CY = 0.40
+_SUBMIT_LABEL_WORDS = ("rebuild", "build")
 
 _PARAM_FORM_MARKERS = ("buildnummm", "parameterized")
 _SUBMIT_CONFIRM_WAIT = 3.0
@@ -1547,6 +1582,38 @@ def _is_submit_button_fill(pixel):
         and blue - red > _SUBMIT_FILL_BLUE_OVER_RED
         and blue - green > _SUBMIT_FILL_BLUE_OVER_GREEN
     )
+
+
+def _submit_scroll_attempts():
+    """How many scroll-and-rescan passes to spend looking for the button."""
+    try:
+        return max(0, int(os.environ.get("ENVPILOT_SUBMIT_SCROLL_ATTEMPTS", "4")))
+    except ValueError:
+        return 4
+
+
+def _interior_fill_fraction(image, box):
+    """Share of the box's own pixels carrying the button fill.
+
+    The cell-density test alone cannot tell a button from a word: both fill
+    their bounding box with touching cells. Measuring the real pixels inside
+    the box separates them cleanly -- a solid button keeps ~0.9 (only its white
+    glyphs interrupt the fill) while navy text keeps ~0.15, the rest being page
+    background between the strokes.
+    """
+    crop = image.convert("RGB").crop(box)
+    width, height = crop.size
+    if not width or not height:
+        return 0.0
+    pixels = crop.load()
+    hits = 0
+    total = 0
+    for y in range(0, height, _SUBMIT_SCAN_STEP_PX):
+        for x in range(0, width, _SUBMIT_SCAN_STEP_PX):
+            total += 1
+            if _is_submit_button_fill(pixels[x, y]):
+                hits += 1
+    return hits / float(total or 1)
 
 
 def _pixel_clusters(cells):
@@ -1572,7 +1639,7 @@ def _pixel_clusters(cells):
     return clusters
 
 
-def _find_submit_button_centre(image):
+def _find_submit_button_centre(image, top_ratio=_SUBMIT_SEARCH_TOP_RATIO):
     """Locate the blue submit button and return its centre as (x, y) ratios.
 
     The styled button carries white text on a solid fill, so Tesseract returns
@@ -1589,7 +1656,7 @@ def _find_submit_button_centre(image):
     if not width or not height:
         return None
 
-    top = int(height * _SUBMIT_SEARCH_TOP_RATIO)
+    top = int(height * top_ratio)
     crop = image.convert("RGB").crop((0, top, width, height))
     crop_width, crop_height = crop.size
     pixels = crop.load()
@@ -1626,6 +1693,15 @@ def _find_submit_button_centre(image):
         if len(cluster) / float(cells_wide * cells_high) < _SUBMIT_MIN_FILL_DENSITY:
             continue
 
+        # Cell density passes for any dense navy shape, text included: the
+        # 15 Sep captures matched the ``BuildNummm`` label at 24%,91% and
+        # clicked it twice while the real button sat below the fold.
+        if (
+            _interior_fill_fraction(image, (left, box_top, right, box_bottom))
+            < _SUBMIT_MIN_INTERIOR_FILL
+        ):
+            continue
+
         candidates.append(
             (
                 box_bottom,
@@ -1640,6 +1716,28 @@ def _find_submit_button_centre(image):
     # The submit button sits below the parameter rows, so prefer the lowest.
     _bottom, x_ratio, y_ratio = max(candidates)
     return x_ratio, y_ratio
+
+
+def _find_submit_label_centre(words):
+    """Centre of a ``Rebuild``/``Build`` token in the lower page, or None.
+
+    The fill scan is the primary finder because the button's white-on-navy
+    label usually returns no token at all. When Tesseract does read it this
+    still beats the compiled fixed offset. Matches above
+    ``_SUBMIT_LABEL_MIN_CY`` are ignored: ``Rebuild`` also appears in the
+    breadcrumb, and clicking that reloads the form with every parameter lost.
+    """
+    best = None
+    for word in words or ():
+        norm = str(word.get("norm") or "").strip()
+        if norm not in _SUBMIT_LABEL_WORDS:
+            continue
+        cx, cy = word.get("cx"), word.get("cy")
+        if cx is None or cy is None or cy < _SUBMIT_LABEL_MIN_CY:
+            continue
+        if best is None or cy > best[1]:
+            best = (float(cx), float(cy))
+    return best
 
 
 def _still_on_param_form(words):
@@ -3882,19 +3980,72 @@ def _apply_overrides(ns):
                 return None
             return not _still_on_param_form(words)
 
-        def _click_located_submit(edge_hwnd, logger):
-            """Click the blue button found by its fill. False when not found."""
-            if not callable(click_client_area):
-                return False
+        def _locate_submit(edge_hwnd, logger, top_ratio):
+            """(x, y) ratios of the submit button in the current viewport."""
             try:
-                image, _words = orig_read(_live_hwnd(edge_hwnd), logger)
-                centre = _find_submit_button_centre(image) if image else None
+                image, words = orig_read(_live_hwnd(edge_hwnd), logger)
             except Exception as exc:
                 if logger is not None:
                     logger.warning(
                         "Jenkins OCR: submit button search failed (%s)", exc
                     )
+                return None
+            if image is None:
+                return None
+            centre = _find_submit_button_centre(image, top_ratio)
+            if centre is not None:
+                return centre
+            centre = _find_submit_label_centre(words)
+            if centre is not None and logger is not None:
+                logger.info(
+                    "Jenkins OCR: no solid button in view, but read a submit "
+                    "label at %.0f%%,%.0f%%",
+                    centre[0] * 100,
+                    centre[1] * 100,
+                )
+            return centre
+
+        def _click_located_submit(edge_hwnd, logger):
+            """Click the blue button found by its fill. False when not found.
+
+            The Rebuild page ends with ``BuildNummm`` at the bottom edge of a
+            1920x1032 window, so its button is below the fold and no scan of
+            the viewport can see it. Scroll down and look again before giving
+            up, otherwise the fallback clicks a guessed position on a form
+            whose button was never on screen.
+            """
+            if not callable(click_client_area):
                 return False
+
+            centre = _locate_submit(edge_hwnd, logger, _SUBMIT_SEARCH_TOP_RATIO)
+            passes = _submit_scroll_attempts() if callable(scroll_down) else 0
+            for attempt in range(1, passes + 1):
+                if centre is not None:
+                    break
+                if logger is not None:
+                    logger.info(
+                        "Jenkins OCR: submit button not in view - scrolling "
+                        "down (pass %d of %d)",
+                        attempt,
+                        passes,
+                    )
+                try:
+                    scroll_down(
+                        _live_hwnd(edge_hwnd), logger, _SUBMIT_SCROLL_NOTCHES
+                    )
+                except Exception as exc:
+                    if logger is not None:
+                        logger.warning(
+                            "Jenkins OCR: scroll towards the submit button "
+                            "failed (%s)",
+                            exc,
+                        )
+                    break
+                time.sleep(1.0)
+                centre = _locate_submit(
+                    edge_hwnd, logger, _SUBMIT_RESCAN_TOP_RATIO
+                )
+
             if centre is None:
                 if logger is not None:
                     logger.info(
